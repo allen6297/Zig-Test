@@ -1,0 +1,53 @@
+#version 450
+
+// GPU frustum culling. One invocation per chunk: test the chunk's AABB against
+// the 6 frustum planes and set its indirect draw command's instanceCount to 1
+// (visible) or 0 (culled → the draw emits nothing). This runs before the render
+// pass; a barrier then lets the indirect draw read the updated commands.
+
+layout(local_size_x = 64) in;
+
+// Must match VkDrawIndexedIndirectCommand exactly (std430, tightly packed).
+struct DrawCmd {
+    uint index_count;
+    uint instance_count;
+    uint first_index;
+    int  vertex_offset;
+    uint first_instance;
+};
+
+layout(std430, binding = 0) readonly buffer Origins { vec4 origins[]; };
+layout(std430, binding = 1) buffer Commands { DrawCmd commands[]; };
+layout(std140, binding = 2) uniform Cull {
+    vec4 planes[6]; // a·x + b·y + c·z + d >= 0 inside the frustum
+    uint count;     // number of chunks
+} cull;
+
+const float CHUNK = 16.0;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= cull.count) return;
+
+    // Origins are indexed by pool slot (stable), and each command carries its
+    // slot in firstInstance (also how the vertex shader looks up its origin).
+    uint slot = commands[i].first_instance;
+    vec3 mn = origins[slot].xyz;
+    vec3 mx = mn + vec3(CHUNK);
+
+    // A box is outside the frustum if it's fully behind any one plane. Testing
+    // the box's "positive vertex" (farthest along the plane normal) is enough.
+    bool visible = true;
+    for (int p = 0; p < 6; p++) {
+        vec4 pl = cull.planes[p];
+        vec3 pv = vec3(pl.x >= 0.0 ? mx.x : mn.x,
+                       pl.y >= 0.0 ? mx.y : mn.y,
+                       pl.z >= 0.0 ? mx.z : mn.z);
+        if (dot(pl.xyz, pv) + pl.w < 0.0) {
+            visible = false;
+            break;
+        }
+    }
+
+    commands[i].instance_count = visible ? 1u : 0u;
+}
