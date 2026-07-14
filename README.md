@@ -310,9 +310,14 @@ which shares the GI's temporal accumulation).
 
 Phases (each independently visible):
 1. [x] **Forward per-pixel lighting** — N·L Lambert from one dynamic coloured point
-   light with falloff + per-vertex AO. (Current renderer.)
-2. **Go deferred** — split shading into a G-buffer pass + a lighting pass; swap
-   MSAA for TAA. (Gateway refactor; no raymarching yet — well-contained.)
+   light with falloff + per-vertex AO. (Superseded by the deferred path below.)
+2. [x] **Go deferred** — G-buffer pass (albedo+AO, world-normal, depth) →
+   fullscreen lighting pass (world pos reconstructed from depth; AO ambient + soft
+   directional sun + one dynamic point light) → **TAA** resolve (depth-reprojected
+   history, 3×3 neighbourhood clamp, ACES tonemap), replacing MSAA. Single-sample
+   throughout; each in-flight frame double-buffers its own targets so its TAA
+   history is the other slot's resolved output. `src/render/renderer.zig`,
+   `src/render/pipeline.zig`, `src/shaders/{gbuffer,fullscreen,lighting,taa}.*`.
 3. **Voxel volume on GPU** — upload chunk blocks as a 3D texture / brickmap (sparse
    + distance LOD so rays skip empty space), kept in sync with the mesh.
 4. **Raymarched shadows** — DDA shadow rays from G-buffer points → hard dynamic

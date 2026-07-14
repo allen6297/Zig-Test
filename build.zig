@@ -121,8 +121,11 @@ pub fn build(b: *std.Build) void {
     // Vulkan consumes SPIR-V, not GLSL, so each shader is compiled at build time
     // with `glslc` and embedded into the binary. In source, `@embedFile(name)`
     // pulls in the compiled bytes (see src/render/pipeline.zig).
-    addShader(b, exe, "src/shaders/triangle.vert", "triangle_vert");
-    addShader(b, exe, "src/shaders/triangle.frag", "triangle_frag");
+    addShader(b, exe, "src/shaders/gbuffer.vert", "gbuffer_vert");
+    addShader(b, exe, "src/shaders/gbuffer.frag", "gbuffer_frag");
+    addShader(b, exe, "src/shaders/fullscreen.vert", "fullscreen_vert");
+    addShader(b, exe, "src/shaders/lighting.frag", "lighting_frag");
+    addShader(b, exe, "src/shaders/taa.frag", "taa_frag");
     addShader(b, exe, "src/shaders/cull.comp", "cull_comp");
     //endregion
 

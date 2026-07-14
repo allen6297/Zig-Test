@@ -253,6 +253,10 @@ fn runLoop(
     var phys_accum: f32 = 0;
     const phys_step: f32 = 1.0 / 60.0;
 
+    // Previous frame's (unjittered) view-projection, for TAA reprojection. Seeded
+    // to identity; the first frame has its history flagged invalid anyway.
+    var prev_viewproj = zig_test.math.Mat4.identity;
+
     // Capture the mouse so motion turns the camera (like any FPS). This hides
     // the cursor and lets us read raw relative motion instead of an absolute
     // position pinned to the window edge.
@@ -326,14 +330,23 @@ fn runLoop(
         const proj = math.Mat4.perspectiveVulkan(std.math.degreesToRadians(60.0), aspect, 0.1, 500.0);
         const viewproj = proj.mul(cam.view());
 
-        // Lighting is flat for now (AO + fixed face shade in the shader), so the
-        // light_* uniform fields are unused. Real lighting returns with deferred.
+        // Deferred lighting: the shader reconstructs each fragment's world
+        // position from depth (needs the inverse view-proj) and TAA reprojects it
+        // through last frame's view-proj (`prev_viewproj`). A warm point light
+        // rides the camera (a headlamp) so lighting is visibly dynamic; the
+        // renderer fills in framebuffer size + TAA jitter itself.
         const planes = math.frustumPlanes(viewproj);
         try renderer.drawFrame(vulkan, swapchain, .{
             .viewproj = viewproj.m,
-            .light_pos = .{ 0, 0, 0, 0 },
-            .light_color = .{ 0, 0, 0, 0 },
+            .inv_viewproj = viewproj.inverse().m,
+            .prev_viewproj = prev_viewproj.m,
+            .light_pos = .{ cam.position.x, cam.position.y, cam.position.z, 0 },
+            .light_color = .{ 1.0, 0.85, 0.6, 3.0 },
+            .camera_pos = .{ cam.position.x, cam.position.y, cam.position.z, 0 },
+            .params = .{ 0, 0, 0, 0 },
+            .taa = .{ 0, 0, 0, 0 },
         }, planes);
+        prev_viewproj = viewproj;
 
         // Once-a-second readout: FPS plus the camera's position and look angles,
         // so we can watch WASD + mouse actually driving the camera with no
@@ -361,7 +374,7 @@ test {
 /// A 2D movement intent on the ground plane, in the range [-1, 1] per axis.
 /// This is deliberately decoupled from SDL so the camera code later doesn't
 /// care where the input came from.
-const Movement = struct { x: f32, y: f32, z: f32, sprint: bool};
+const Movement = struct { x: f32, y: f32, z: f32, sprint: bool };
 
 /// Translate the raw keyboard-state array into WASD movement intent.
 /// `keys` is SDL's snapshot: index by scancode, non-zero means held.

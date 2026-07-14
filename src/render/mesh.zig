@@ -47,16 +47,31 @@ pub fn pack(x: u32, y: u32, z: u32, face: Face, block: u32, ao: u32) Vertex {
         (@as(u32, @intFromEnum(face)) << 18) | (block << 21) | (ao << 29) };
 }
 
-/// Per-frame shader data, shared by every chunk. Laid out to match the shader's
-/// std140 uniform block (mat4 = 64 B, vec4 = 16 B, all 16-byte aligned).
-///   - `viewproj`    : projection × view (the per-chunk model offset is a push
-///                     constant instead — see `PushConstants`).
-///   - `light_pos`   : world-space point-light position (xyz; w unused).
-///   - `light_color` : light colour (rgb) × intensity in w.
+/// Per-frame shader data, shared by every chunk and by the deferred lighting /
+/// TAA passes. Laid out to match the shaders' std140 uniform block (mat4 = 64 B,
+/// vec4 = 16 B, everything 16-byte aligned, so the fields pack with no padding).
+///   - `viewproj`      : **unjittered** projection × view. The geometry pass adds
+///                       the sub-pixel TAA jitter itself (`params.zw`), so this
+///                       stays clean and `inv_viewproj` is its exact inverse.
+///   - `inv_viewproj`  : inverse of `viewproj` — reconstructs a fragment's world
+///                       position from its depth in the lighting + TAA passes.
+///   - `prev_viewproj` : previous frame's unjittered view × proj — used by TAA to
+///                       reproject a world point into last frame's screen.
+///   - `light_pos`     : world-space point-light position (xyz; w unused).
+///   - `light_color`   : light colour (rgb) × intensity in w.
+///   - `camera_pos`    : world-space eye position (xyz; w unused).
+///   - `params`        : xy = framebuffer size in px; zw = current jitter (NDC).
+///   - `taa`           : x = history-valid flag (0 on the first frames / after a
+///                       resize, else 1); yzw reserved.
 pub const Uniforms = extern struct {
     viewproj: [16]f32,
+    inv_viewproj: [16]f32,
+    prev_viewproj: [16]f32,
     light_pos: [4]f32,
     light_color: [4]f32,
+    camera_pos: [4]f32,
+    params: [4]f32,
+    taa: [4]f32,
 };
 
 /// Per-chunk data, stored in a storage buffer and indexed by `gl_DrawID` during

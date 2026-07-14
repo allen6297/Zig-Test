@@ -103,10 +103,10 @@ pub const Mat4 = struct {
         const u = s.cross(f); // recomputed true up
 
         return .{ .m = .{
-            s.x,           u.x,           -f.x,         0,
-            s.y,           u.y,           -f.y,         0,
-            s.z,           u.z,           -f.z,         0,
-            -s.dot(eye),   -u.dot(eye),   f.dot(eye),   1,
+            s.x,         u.x,         -f.x,       0,
+            s.y,         u.y,         -f.y,       0,
+            s.z,         u.z,         -f.z,       0,
+            -s.dot(eye), -u.dot(eye), f.dot(eye), 1,
         } };
     }
 
@@ -134,6 +134,40 @@ pub const Mat4 = struct {
         out.m[10] = far / (near - far);
         out.m[11] = -1.0;
         out.m[14] = (near * far) / (near - far);
+        return out;
+    }
+
+    /// Full 4x4 inverse (cofactor / adjugate method, the classic MESA
+    /// `gluInvertMatrix`). Used to reconstruct a fragment's world position from
+    /// its depth in the deferred lighting pass: `inv(viewproj) * clip = world`.
+    /// Returns `identity` for a singular (non-invertible) matrix rather than
+    /// producing NaNs — callers only feed it well-formed view-projections.
+    pub fn inverse(a: Mat4) Mat4 {
+        const m = a.m;
+        var inv: [16]f32 = undefined;
+
+        inv[0] = m[5] * m[10] * m[15] - m[5] * m[11] * m[14] - m[9] * m[6] * m[15] + m[9] * m[7] * m[14] + m[13] * m[6] * m[11] - m[13] * m[7] * m[10];
+        inv[4] = -m[4] * m[10] * m[15] + m[4] * m[11] * m[14] + m[8] * m[6] * m[15] - m[8] * m[7] * m[14] - m[12] * m[6] * m[11] + m[12] * m[7] * m[10];
+        inv[8] = m[4] * m[9] * m[15] - m[4] * m[11] * m[13] - m[8] * m[5] * m[15] + m[8] * m[7] * m[13] + m[12] * m[5] * m[11] - m[12] * m[7] * m[9];
+        inv[12] = -m[4] * m[9] * m[14] + m[4] * m[10] * m[13] + m[8] * m[5] * m[14] - m[8] * m[6] * m[13] - m[12] * m[5] * m[10] + m[12] * m[6] * m[9];
+        inv[1] = -m[1] * m[10] * m[15] + m[1] * m[11] * m[14] + m[9] * m[2] * m[15] - m[9] * m[3] * m[14] - m[13] * m[2] * m[11] + m[13] * m[3] * m[10];
+        inv[5] = m[0] * m[10] * m[15] - m[0] * m[11] * m[14] - m[8] * m[2] * m[15] + m[8] * m[3] * m[14] + m[12] * m[2] * m[11] - m[12] * m[3] * m[10];
+        inv[9] = -m[0] * m[9] * m[15] + m[0] * m[11] * m[13] + m[8] * m[1] * m[15] - m[8] * m[3] * m[13] - m[12] * m[1] * m[11] + m[12] * m[3] * m[9];
+        inv[13] = m[0] * m[9] * m[14] - m[0] * m[10] * m[13] - m[8] * m[1] * m[14] + m[8] * m[2] * m[13] + m[12] * m[1] * m[10] - m[12] * m[2] * m[9];
+        inv[2] = m[1] * m[6] * m[15] - m[1] * m[7] * m[14] - m[5] * m[2] * m[15] + m[5] * m[3] * m[14] + m[13] * m[2] * m[7] - m[13] * m[3] * m[6];
+        inv[6] = -m[0] * m[6] * m[15] + m[0] * m[7] * m[14] + m[4] * m[2] * m[15] - m[4] * m[3] * m[14] - m[12] * m[2] * m[7] + m[12] * m[3] * m[6];
+        inv[10] = m[0] * m[5] * m[15] - m[0] * m[7] * m[13] - m[4] * m[1] * m[15] + m[4] * m[3] * m[13] + m[12] * m[1] * m[7] - m[12] * m[3] * m[5];
+        inv[14] = -m[0] * m[5] * m[14] + m[0] * m[6] * m[13] + m[4] * m[1] * m[14] - m[4] * m[2] * m[13] - m[12] * m[1] * m[6] + m[12] * m[2] * m[5];
+        inv[3] = -m[1] * m[6] * m[11] + m[1] * m[7] * m[10] + m[5] * m[2] * m[11] - m[5] * m[3] * m[10] - m[9] * m[2] * m[7] + m[9] * m[3] * m[6];
+        inv[7] = m[0] * m[6] * m[11] - m[0] * m[7] * m[10] - m[4] * m[2] * m[11] + m[4] * m[3] * m[10] + m[8] * m[2] * m[7] - m[8] * m[3] * m[6];
+        inv[11] = -m[0] * m[5] * m[11] + m[0] * m[7] * m[9] + m[4] * m[1] * m[11] - m[4] * m[3] * m[9] - m[8] * m[1] * m[7] + m[8] * m[3] * m[5];
+        inv[15] = m[0] * m[5] * m[10] - m[0] * m[6] * m[9] - m[4] * m[1] * m[10] + m[4] * m[2] * m[9] + m[8] * m[1] * m[6] - m[8] * m[2] * m[5];
+
+        const det = m[0] * inv[0] + m[1] * inv[4] + m[2] * inv[8] + m[3] * inv[12];
+        if (det == 0) return identity;
+        const inv_det = 1.0 / det;
+        var out: Mat4 = undefined;
+        for (inv, 0..) |v, i| out.m[i] = v * inv_det;
         return out;
     }
 };
@@ -224,6 +258,14 @@ test "lookAt down -Z with +Y up is the identity" {
         .{ .x = 0, .y = 1, .z = 0 },
     );
     for (Mat4.identity.m, v.m) |expected, got| try expectApprox(got, expected, 1e-5);
+}
+
+test "inverse composes with the original to the identity" {
+    const proj = Mat4.perspectiveVulkan(std.math.degreesToRadians(60.0), 1.6, 0.1, 100.0);
+    const view = Mat4.lookAt(.{ .x = 3, .y = 4, .z = 5 }, Vec3.zero, .{ .x = 0, .y = 1, .z = 0 });
+    const vp = proj.mul(view);
+    const round_trip = vp.mul(vp.inverse());
+    for (Mat4.identity.m, round_trip.m) |expected, got| try expectApprox(got, expected, 1e-4);
 }
 
 fn insideFrustum(planes: [6][4]f32, p: Vec3) bool {
