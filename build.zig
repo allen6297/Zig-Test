@@ -185,6 +185,18 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
 
+    //region savdump (decode .sav files)
+    // Convenience step: `zig build savdump` runs the standalone Python decoder
+    // in tools/decode_sav.py, which pretty-prints player.sav / world.sav. Run
+    // from the project root so it finds the save files there. Extra args pass
+    // through, e.g. `zig build savdump -- path/to/world.sav`.
+    const savdump_cmd = b.addSystemCommand(&.{ "python3", "tools/decode_sav.py" });
+    savdump_cmd.setCwd(b.path("."));
+    if (b.args) |args| savdump_cmd.addArgs(args);
+    const savdump_step = b.step("savdump", "Decode the .sav files to text");
+    savdump_step.dependOn(&savdump_cmd.step);
+    //endregion
+
     // Just like flags, top level steps are also listed in the `--help` menu.
     //
     // The Zig build system is entirely implemented in userland, which means

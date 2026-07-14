@@ -1,0 +1,18 @@
+<component name="ProjectRunConfigurationManager">
+  <configuration default="false" name="Build and Test" type="ZIGBRAINS_BUILD" factoryName="ZIGBRAINS_BUILD">
+    <ZigBrainsOption name="workingDirectory" value="$PROJECT_DIR$" />
+    <envs>
+      <env name="DYLD_LIBRARY_PATH" value="$USER_HOME$/VulkanSDK/1.4.341.1/macOS/lib" />
+      <env name="VK_ADD_LAYER_PATH" value="$USER_HOME$/VulkanSDK/1.4.341.1/macOS/share/vulkan/explicit_layer.d" />
+      <env name="VK_ICD_FILENAMES" value="$USER_HOME$/VulkanSDK/1.4.341.1/macOS/share/vulkan/icd.d/MoltenVK_icd.json" />
+      <env name="VULKAN_SDK" value="$USER_HOME$/VulkanSDK/1.4.341.1/macOS" />
+    </envs>
+    <ZigBrainsOption name="buildSteps" value="test" />
+    <ZigBrainsOption name="compilerArgs" value="" />
+    <ZigBrainsOption name="debugBuildSteps" value="" />
+    <ZigBrainsOption name="debugCompilerArgs" value="" />
+    <ZigBrainsOption name="exePath" value="" />
+    <ZigBrainsOption name="exeArgs" value="" />
+    <method v="2" />
+  </configuration>
+</component>
