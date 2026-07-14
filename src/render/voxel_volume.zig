@@ -8,9 +8,13 @@
 //! box is chunk-aligned, so a rebuild fills it chunk-by-chunk (one hashmap lookup
 //! per chunk) rather than per-voxel.
 //!
-//! v1 uploads via a one-time submit + `queueWaitIdle`, so a re-centre briefly
-//! stalls the GPU. Fine at this scale; the optimisation (async copies, only the
-//! newly-exposed slab) is noted in the roadmap.
+//! Uploads are **asynchronous**: a rebuild/edit only fills the host-visible
+//! staging buffer and sets `dirty`; the renderer records the staging→image copy
+//! into the frame's command buffer (`recordUpload`) before the lighting pass, so
+//! there's no `queueWaitIdle` stall. The volume image is shared across in-flight
+//! frames, so a copy on a dirty frame can overlap the other frame still sampling
+//! it — a benign cross-frame hazard (at worst a one-frame partial-shadow glitch,
+//! smoothed by TAA), the same class the renderer already tolerates elsewhere.
 
 const std = @import("std");
 const vk = @import("vulkan");
@@ -35,8 +39,10 @@ pub const VoxelVolume = struct {
     memory: vk.DeviceMemory,
     view: vk.ImageView,
     staging: Buffer,
-    pool: vk.CommandPool,
     layout: vk.ImageLayout,
+    /// Set when the staging buffer has changes not yet copied to the image; the
+    /// renderer records the copy on the next frame (see `recordUpload`).
+    dirty: bool,
     /// World-space minimum corner of the box (chunk-aligned). Sentinel until the
     /// first `recenter`, so the first call always rebuilds.
     origin: [3]i32,
@@ -44,12 +50,6 @@ pub const VoxelVolume = struct {
     pub fn init(ctx: *const Context) !VoxelVolume {
         const vkd = ctx.vkd;
         const dev = ctx.device;
-
-        const pool = try vkd.createCommandPool(dev, &.{
-            .flags = .{ .transient_bit = true, .reset_command_buffer_bit = true },
-            .queue_family_index = ctx.queue_families.graphics,
-        }, null);
-        errdefer vkd.destroyCommandPool(dev, pool, null);
 
         const image = try vkd.createImage(dev, &.{
             .image_type = .@"3d",
@@ -90,15 +90,14 @@ pub const VoxelVolume = struct {
             .memory = memory,
             .view = view,
             .staging = staging,
-            .pool = pool,
             .layout = .undefined,
+            .dirty = true, // frame 1 uploads the primed (all-empty) contents
             .origin = .{ std.math.minInt(i32), 0, std.math.minInt(i32) },
         };
 
-        // Prime the texture (all-empty) so it's in a sampleable layout before the
-        // first frame — the real contents arrive on the first `recenter`.
+        // Prime the staging buffer (all-empty); the first frame's `recordUpload`
+        // gets it into a sampleable layout, and the first `recenter` fills it.
         @memset(self.staging.mapped[0..voxel_count], 0);
-        self.uploadRegion(ctx, fullRegion());
         return self;
     }
 
@@ -107,13 +106,12 @@ pub const VoxelVolume = struct {
         ctx.vkd.destroyImage(ctx.device, self.image, null);
         ctx.vkd.freeMemory(ctx.device, self.memory, null);
         self.staging.deinit(ctx);
-        ctx.vkd.destroyCommandPool(ctx.device, self.pool, null);
     }
 
     /// Re-anchor the box on the player and rebuild. Rebuilds when the box moved to
     /// a new chunk, or when `force` is set (e.g. chunks streamed in at the same
     /// position). Returns true if a rebuild happened.
-    pub fn recenter(self: *VoxelVolume, ctx: *const Context, world: *World, pos: [3]f32, force: bool) bool {
+    pub fn recenter(self: *VoxelVolume, world: *World, pos: [3]f32, force: bool) bool {
         const pcx = @divFloor(@as(i32, @intFromFloat(@floor(pos[0]))), cs);
         const pcz = @divFloor(@as(i32, @intFromFloat(@floor(pos[2]))), cs);
         const half_x: i32 = @intCast(dim_x / cs / 2); // half the box width, in chunks
@@ -122,12 +120,13 @@ pub const VoxelVolume = struct {
         const moved = new_origin[0] != self.origin[0] or new_origin[2] != self.origin[2];
         if (!moved and !force) return false;
         self.origin = new_origin;
-        self.rebuild(ctx, world);
+        self.rebuild(world);
         return true;
     }
 
-    /// Refill the whole box from the world at the current origin and upload it.
-    fn rebuild(self: *VoxelVolume, ctx: *const Context, world: *World) void {
+    /// Refill the whole box from the world at the current origin (into staging);
+    /// the copy to the image is deferred to `recordUpload`.
+    fn rebuild(self: *VoxelVolume, world: *World) void {
         const ocx = @divFloor(self.origin[0], cs);
         const ocz = @divFloor(self.origin[2], cs);
         const buf = self.staging.mapped;
@@ -157,51 +156,33 @@ pub const VoxelVolume = struct {
                 }
             }
         }
-        self.uploadRegion(ctx, fullRegion());
+        self.dirty = true;
     }
 
     /// Patch a single voxel's solidity (call after a block edit). No-op if the
-    /// voxel is outside the current box.
-    pub fn setVoxel(self: *VoxelVolume, ctx: *const Context, world: *World, wx: i32, wy: i32, wz: i32) void {
+    /// voxel is outside the current box. Marks the volume dirty; the whole staging
+    /// buffer is re-copied on the next frame (edits are rare, so this is cheap).
+    pub fn setVoxel(self: *VoxelVolume, world: *World, wx: i32, wy: i32, wz: i32) void {
         const lx = wx - self.origin[0];
         const ly = wy - self.origin[1];
         const lz = wz - self.origin[2];
         if (lx < 0 or ly < 0 or lz < 0 or lx >= dim_x or ly >= dim_y or lz >= dim_z) return;
         const idx: usize = @intCast(lx + ly * @as(i32, dim_x) + lz * @as(i32, dim_x * dim_y));
         self.staging.mapped[idx] = if (world.blockAt(wx, wy, wz).isSolid()) 255 else 0;
-        self.uploadRegion(ctx, .{
-            .buffer_offset = idx,
-            .buffer_row_length = 0,
-            .buffer_image_height = 0,
-            .image_subresource = .{ .aspect_mask = .{ .color_bit = true }, .mip_level = 0, .base_array_layer = 0, .layer_count = 1 },
-            .image_offset = .{ .x = lx, .y = ly, .z = lz },
-            .image_extent = .{ .width = 1, .height = 1, .depth = 1 },
-        });
+        self.dirty = true;
     }
 
-    /// Copy `region` of the staging buffer into the texture via a one-time submit.
-    /// Transitions the image to TRANSFER_DST and back to SHADER_READ_ONLY.
-    fn uploadRegion(self: *VoxelVolume, ctx: *const Context, region: vk.BufferImageCopy) void {
-        const vkd = ctx.vkd;
-        const dev = ctx.device;
-
-        var cmd: vk.CommandBuffer = undefined;
-        vkd.allocateCommandBuffers(dev, &.{ .command_pool = self.pool, .level = .primary, .command_buffer_count = 1 }, @ptrCast(&cmd)) catch return;
-        defer vkd.freeCommandBuffers(dev, self.pool, &.{cmd});
-
-        vkd.beginCommandBuffer(cmd, &.{ .flags = .{ .one_time_submit_bit = true } }) catch return;
-
-        // old layout → TRANSFER_DST
+    /// If dirty, record a staging→image copy into `cmd` (called by the renderer at
+    /// the start of a frame, outside any render pass). Transitions the image to
+    /// TRANSFER_DST and back to SHADER_READ_ONLY, then clears `dirty`.
+    pub fn recordUpload(self: *VoxelVolume, vkd: vk.DeviceWrapper, cmd: vk.CommandBuffer) void {
+        if (!self.dirty) return;
         const src = layoutSrc(self.layout);
         barrier(vkd, cmd, self.image, self.layout, .transfer_dst_optimal, src.stage, .{ .transfer_bit = true }, src.access, .{ .transfer_write_bit = true });
-        vkd.cmdCopyBufferToImage(cmd, self.staging.handle, self.image, .transfer_dst_optimal, &.{region});
-        // TRANSFER_DST → SHADER_READ_ONLY
+        vkd.cmdCopyBufferToImage(cmd, self.staging.handle, self.image, .transfer_dst_optimal, &.{fullRegion()});
         barrier(vkd, cmd, self.image, .transfer_dst_optimal, .shader_read_only_optimal, .{ .transfer_bit = true }, .{ .fragment_shader_bit = true }, .{ .transfer_write_bit = true }, .{ .shader_read_bit = true });
-
-        vkd.endCommandBuffer(cmd) catch return;
-        vkd.queueSubmit(ctx.graphics_queue, &.{.{ .command_buffer_count = 1, .p_command_buffers = &.{cmd} }}, .null_handle) catch return;
-        vkd.queueWaitIdle(ctx.graphics_queue) catch {};
         self.layout = .shader_read_only_optimal;
+        self.dirty = false;
     }
 };
 

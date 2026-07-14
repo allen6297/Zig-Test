@@ -461,14 +461,15 @@ pub const Renderer = struct {
 
     /// Re-anchor + rebuild the shadow voxel volume around `pos` if the player
     /// crossed into a new chunk (or `force`, e.g. after streaming). Returns true
-    /// if it rebuilt; cheap no-op otherwise.
-    pub fn recenterShadows(self: *Renderer, ctx: *const Context, world: *World, pos: [3]f32, force: bool) bool {
-        return self.shadow_volume.recenter(ctx, world, pos, force);
+    /// if it rebuilt; cheap no-op otherwise. Only fills the staging buffer — the
+    /// GPU copy is recorded in the next frame (no stall).
+    pub fn recenterShadows(self: *Renderer, world: *World, pos: [3]f32, force: bool) bool {
+        return self.shadow_volume.recenter(world, pos, force);
     }
 
     /// Patch one voxel in the shadow volume after a block edit.
-    pub fn editShadowVoxel(self: *Renderer, ctx: *const Context, world: *World, x: i32, y: i32, z: i32) void {
-        self.shadow_volume.setVoxel(ctx, world, x, y, z);
+    pub fn editShadowVoxel(self: *Renderer, world: *World, x: i32, y: i32, z: i32) void {
+        self.shadow_volume.setVoxel(world, x, y, z);
     }
 
     /// Mark the active set changed. Cheap — each frame rebuilds its own indirect
@@ -583,6 +584,10 @@ pub const Renderer = struct {
         const vkd = ctx.vkd;
         const f = self.current_frame;
         try vkd.beginCommandBuffer(cmd, &.{});
+
+        // Upload any pending shadow-volume changes (staging → 3D texture) before
+        // anything samples it. No-op unless the volume was rebuilt/edited.
+        self.shadow_volume.recordUpload(vkd, cmd);
 
         // GPU frustum cull first — must be outside any render pass.
         self.culler.dispatch(ctx, cmd, f, planes);

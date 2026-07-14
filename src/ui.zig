@@ -104,6 +104,7 @@ pub const Debug = struct {
     yaw: f32,
     pitch: f32,
     chunks: usize,
+    creative: *bool, // fly + noclip debug mode
     light_rgb: *[3]f32,
     light_intensity: *f32,
     sun_azimuth: *f32, // degrees around the horizon
@@ -118,13 +119,15 @@ pub fn debugWindow(d: Debug) void {
         zgui.text("Yaw: {d:.2}  Pitch: {d:.2}", .{ d.yaw, d.pitch });
         zgui.text("Chunks resident: {d}", .{d.chunks});
         zgui.separator();
+        _ = zgui.checkbox("Creative (fly + noclip)", .{ .v = d.creative });
+        zgui.separator();
         _ = zgui.colorEdit3("Light color", .{ .col = d.light_rgb });
         _ = zgui.sliderFloat("Light intensity", .{ .v = d.light_intensity, .min = 0, .max = 10 });
         zgui.separator();
         _ = zgui.sliderFloat("Sun azimuth", .{ .v = d.sun_azimuth, .min = 0, .max = 360 });
         _ = zgui.sliderFloat("Sun elevation", .{ .v = d.sun_elevation, .min = 2, .max = 90 });
         zgui.separator();
-        zgui.textUnformatted("` (backtick): toggle mouse capture / UI focus");
+        zgui.textUnformatted("` (backtick): toggle mouse / UI    F: creative mode");
     }
     zgui.end();
 }

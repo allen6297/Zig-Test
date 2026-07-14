@@ -154,10 +154,13 @@ fn savePlayer(io: std.Io, player: *const zig_test.player.Player, cam: *const zig
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = player_save_path, .data = std.mem.asBytes(&s) });
 }
 
-/// Deterministic terrain generator: fills a chunk from its world coordinate with
-/// a rolling heightmap. A pure function of the coordinate, so any chunk can be
-/// regenerated identically on demand. (Real noise-based terrain is a later step.)
+/// Deterministic terrain generator. A pure function of the world coordinate (so
+/// any chunk regenerates identically on demand): a fractal-noise heightmap for
+/// rolling hills, grass/dirt/stone layering, and 3D noise carving out caves.
+const gen_seed: u32 = 1337;
+
 fn genChunk(coord: zig_test.world.Coord, chunk: *zig_test.chunk.Chunk) void {
+    const noise = zig_test.noise;
     const size = zig_test.chunk.size;
     var lx: usize = 0;
     while (lx < size) : (lx += 1) {
@@ -165,11 +168,28 @@ fn genChunk(coord: zig_test.world.Coord, chunk: *zig_test.chunk.Chunk) void {
         while (lz < size) : (lz += 1) {
             const wx: f32 = @floatFromInt(coord.x * size + @as(i32, @intCast(lx)));
             const wz: f32 = @floatFromInt(coord.z * size + @as(i32, @intCast(lz)));
-            const height: i32 = @intFromFloat(18.0 + 6.0 * @sin(wx * 0.08) + 6.0 * @cos(wz * 0.07));
+
+            // Surface height from fBm: a low base plus noise-driven relief. The low
+            // frequency (0.008) gives broad hills; 5 octaves add finer bumps. Kept
+            // within the 3-chunk-tall world (0..48).
+            const h = noise.fbm2(wx * 0.008, wz * 0.008, gen_seed, 5);
+            const height: i32 = 10 + @as(i32, @intFromFloat(h * 34.0));
+
             var ly: usize = 0;
             while (ly < size) : (ly += 1) {
                 const wy: i32 = coord.y * size + @as(i32, @intCast(ly));
                 if (wy >= height) continue;
+
+                // Caves: 3D noise carves hollows. The carve threshold is
+                // depth-graduated — roomy caves deep down (fBm > 0.60 ≈ 20% of
+                // voxels), getting rarer toward the surface (up to > 0.72 ≈ 4%) so
+                // they occasionally break through as cave mouths instead of pocking
+                // the whole surface with holes.
+                const depth = @min(height - wy, 4); // 1 at surface .. 4 deep
+                const threshold = 0.60 + 0.04 * @as(f32, @floatFromInt(4 - depth));
+                const cave = noise.fbm3(wx * 0.045, @as(f32, @floatFromInt(wy)) * 0.045, wz * 0.045, gen_seed +% 99, 3);
+                if (cave > threshold) continue; // hollow
+
                 const block: zig_test.block.BlockId =
                     if (wy + 1 == height) .grass else if (wy + 3 >= height) .dirt else .stone;
                 chunk.set(lx, ly, lz, block);
@@ -266,6 +286,7 @@ fn runLoop(
     // Debug-overlay state. `ui_focus` releases the mouse for the UI (` toggles);
     // the light colour/intensity are live-edited in the overlay; FPS is smoothed.
     var ui_focus = false;
+    var creative = false; // fly + noclip debug mode (toggle: F or the overlay)
     var light_rgb = [3]f32{ 1.0, 0.85, 0.6 };
     var light_intensity: f32 = 3.0;
     // Sun direction as azimuth (around the horizon) + elevation (above it), in
@@ -311,6 +332,8 @@ fn runLoop(
                         ui_focus = !ui_focus;
                         _ = c.SDL_SetWindowRelativeMouseMode(window, !ui_focus);
                     }
+                    // F toggles creative mode (fly + noclip) for debugging.
+                    if (event.key.scancode == c.SDL_SCANCODE_F and !ui_focus) creative = !creative;
                 },
                 c.SDL_EVENT_MOUSE_MOTION => {
                     // `xrel`/`yrel` are how far the mouse moved since last event.
@@ -323,13 +346,13 @@ fn runLoop(
                         if (zig_test.raycast.raycastVoxel(stream.world, cam.position, cam.forward(), 6.0)) |h| {
                             if (event.button.button == c.SDL_BUTTON_LEFT) {
                                 try stream.editBlock(vulkan, h.block[0], h.block[1], h.block[2], .air);
-                                renderer.editShadowVoxel(vulkan, stream.world, h.block[0], h.block[1], h.block[2]);
+                                renderer.editShadowVoxel(stream.world, h.block[0], h.block[1], h.block[2]);
                             } else if (event.button.button == c.SDL_BUTTON_RIGHT) {
                                 const px = h.block[0] + h.normal[0];
                                 const py = h.block[1] + h.normal[1];
                                 const pz = h.block[2] + h.normal[2];
                                 try stream.editBlock(vulkan, px, py, pz, .stone);
-                                renderer.editShadowVoxel(vulkan, stream.world, px, py, pz);
+                                renderer.editShadowVoxel(stream.world, px, py, pz);
                             }
                         }
                     }
@@ -345,16 +368,34 @@ fn runLoop(
         // No player movement while the overlay has focus (so typing/clicks don't walk).
         const move = if (ui_focus) Movement{ .x = 0, .y = 0, .z = 0, .sprint = false } else readMovement(keys);
 
-        // 4. Physics: step the player on a fixed timestep (stable collision),
-        //    then place the camera at its eyes. Look stays per-frame (mouse).
-        //    advance = -move.z (W → forward), strafe = move.x, jump = space.
-        //    Collision reads the world grid, but streaming loads chunks lazily —
-        //    so we generate the chunks around the player up front (cheap, cached)
-        //    to guarantee there's ground under them (else they fall on spawn).
-        phys_accum += @floatCast(dt);
-        while (phys_accum >= phys_step) : (phys_accum -= phys_step) {
+        // 4. Movement. Creative: free flight + noclip — move the feet position
+        //    directly along the look direction (W/S), strafe (A/D), and world-up
+        //    (space/shift), no gravity or collision. Normal: step the player on a
+        //    fixed timestep (stable collision), advancing/strafing by yaw with
+        //    space to jump. Either way, the camera rides the player's eyes.
+        //    Collision/ground reads the world grid, but streaming loads chunks
+        //    lazily — so we generate the chunks around the player up front (cheap,
+        //    cached) to guarantee there's ground under them (else they fall on spawn).
+        if (creative) {
             ensurePlayerChunks(stream.world, player.pos);
-            player.step(stream.world, -move.z, move.x, move.y < 0, move.sprint, cam.yaw, phys_step);
+            const speed: f32 = if (move.sprint) 40.0 else 16.0;
+            const fwd = cam.forward(); // includes pitch, so you fly where you look
+            const right = cam.right();
+            var wish = fwd.scale(-move.z).add(right.scale(move.x));
+            wish.y += -move.y; // space (move.y = -1) up, shift (move.y = +1) down
+            if (wish.length() > 0) {
+                wish = wish.normalize().scale(speed * @as(f32, @floatCast(dt)));
+                player.pos = player.pos.add(wish);
+            }
+            player.vel = zig_test.math.Vec3.zero;
+            player.on_ground = false;
+            phys_accum = 0; // don't accumulate physics debt while flying
+        } else {
+            phys_accum += @floatCast(dt);
+            while (phys_accum >= phys_step) : (phys_accum -= phys_step) {
+                ensurePlayerChunks(stream.world, player.pos);
+                player.step(stream.world, -move.z, move.x, move.y < 0, move.sprint, cam.yaw, phys_step);
+            }
         }
         cam.position = player.eye();
 
@@ -367,7 +408,7 @@ fn runLoop(
         shadow_timer += 1;
         const shadow_chunks = renderer.chunkCount();
         const force_shadows = shadow_chunks != last_shadow_chunks and shadow_timer >= 30;
-        if (renderer.recenterShadows(vulkan, stream.world, .{ cam.position.x, cam.position.y, cam.position.z }, force_shadows)) {
+        if (renderer.recenterShadows(stream.world, .{ cam.position.x, cam.position.y, cam.position.z }, force_shadows)) {
             last_shadow_chunks = shadow_chunks;
             shadow_timer = 0;
         }
@@ -387,6 +428,7 @@ fn runLoop(
             .yaw = cam.yaw,
             .pitch = cam.pitch,
             .chunks = renderer.chunkCount(),
+            .creative = &creative,
             .light_rgb = &light_rgb,
             .light_intensity = &light_intensity,
             .sun_azimuth = &sun_azimuth,
