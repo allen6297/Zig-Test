@@ -63,6 +63,9 @@ pub fn pack(x: u32, y: u32, z: u32, face: Face, block: u32, ao: u32) Vertex {
 ///   - `params`        : xy = framebuffer size in px; zw = current jitter (NDC).
 ///   - `taa`           : x = history-valid flag (0 on the first frames / after a
 ///                       resize, else 1); yzw reserved.
+///   - `shadow_origin` : world-space minimum corner of the shadow voxel volume
+///                       (xyz; w unused). The volume is 1 voxel per world unit.
+///   - `shadow_dim`    : shadow volume size in voxels (xyz; w unused).
 pub const Uniforms = extern struct {
     viewproj: [16]f32,
     inv_viewproj: [16]f32,
@@ -72,6 +75,9 @@ pub const Uniforms = extern struct {
     camera_pos: [4]f32,
     params: [4]f32,
     taa: [4]f32,
+    shadow_origin: [4]f32,
+    shadow_dim: [4]f32,
+    sun_dir: [4]f32, // xyz = direction toward the sun (normalized); w unused
 };
 
 /// Per-chunk data, stored in a storage buffer and indexed by `gl_DrawID` during

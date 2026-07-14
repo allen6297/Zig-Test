@@ -34,6 +34,8 @@ const mesh = @import("mesh.zig");
 const Mesh = @import("chunk_mesh.zig").Mesh;
 const Pool = @import("mesh_pool.zig").Pool;
 const Culler = @import("cull.zig").Culler;
+const VoxelVolume = @import("voxel_volume.zig").VoxelVolume;
+const World = @import("zig_test").world.World;
 
 /// A chunk's geometry as it lives in the pool: which slot and how many indices.
 const ChunkSlot = struct {
@@ -175,6 +177,9 @@ pub const Renderer = struct {
     lit: [max_frames_in_flight]Attachment,
     resolved: [max_frames_in_flight]Attachment, // TAA output + next-frame history
 
+    // Voxel solidity volume for raymarched sun shadows (sampled in the lighting pass).
+    shadow_volume: VoxelVolume,
+
     pub fn init(
         ctx: *const Context,
         swapchain: *const Swapchain,
@@ -199,14 +204,16 @@ pub const Renderer = struct {
         errdefer vkd.destroyDescriptorSetLayout(dev, geo_set_layout, null);
 
         // Post set (shared by lighting + TAA): binding 0 uniforms, bindings 1..3
-        // sampled inputs. Both passes read three textures in the fragment stage.
+        // sampled 2D inputs, binding 4 the 3D shadow volume (used by lighting; the
+        // TAA pass declares it too so both can share one layout).
         const post_set_layout = try vkd.createDescriptorSetLayout(dev, &.{
-            .binding_count = 4,
+            .binding_count = 5,
             .p_bindings = &.{
                 .{ .binding = 0, .descriptor_type = .uniform_buffer, .descriptor_count = 1, .stage_flags = .{ .fragment_bit = true } },
                 .{ .binding = 1, .descriptor_type = .combined_image_sampler, .descriptor_count = 1, .stage_flags = .{ .fragment_bit = true } },
                 .{ .binding = 2, .descriptor_type = .combined_image_sampler, .descriptor_count = 1, .stage_flags = .{ .fragment_bit = true } },
                 .{ .binding = 3, .descriptor_type = .combined_image_sampler, .descriptor_count = 1, .stage_flags = .{ .fragment_bit = true } },
+                .{ .binding = 4, .descriptor_type = .combined_image_sampler, .descriptor_count = 1, .stage_flags = .{ .fragment_bit = true } },
             },
         }, null);
         errdefer vkd.destroyDescriptorSetLayout(dev, post_set_layout, null);
@@ -289,6 +296,9 @@ pub const Renderer = struct {
             lit[i] = try Attachment.init(ctx, extent, hdr_format, color_sampled, .{ .color_bit = true });
             resolved[i] = try Attachment.init(ctx, extent, hdr_format, color_sampled, .{ .color_bit = true });
         }
+
+        var shadow_volume = try VoxelVolume.init(ctx);
+        errdefer shadow_volume.deinit(ctx);
         //endregion
 
         //region descriptor pool + sets
@@ -298,7 +308,7 @@ pub const Renderer = struct {
             .p_pool_sizes = &.{
                 .{ .type = .uniform_buffer, .descriptor_count = 3 * max_frames_in_flight },
                 .{ .type = .storage_buffer, .descriptor_count = max_frames_in_flight },
-                .{ .type = .combined_image_sampler, .descriptor_count = 2 * 3 * max_frames_in_flight },
+                .{ .type = .combined_image_sampler, .descriptor_count = 2 * 4 * max_frames_in_flight },
             },
         }, null);
         errdefer vkd.destroyDescriptorPool(dev, descriptor_pool, null);
@@ -317,18 +327,22 @@ pub const Renderer = struct {
             // Geometry set: uniforms + per-chunk origins.
             writeBuffer(vkd, dev, geo_sets[i], 0, .uniform_buffer, ub, @sizeOf(mesh.Uniforms));
             writeBuffer(vkd, dev, geo_sets[i], 1, .storage_buffer, chunk_data_buffer.handle, vk.WHOLE_SIZE);
-            // Lighting set: uniforms + G-buffer (albedo, normal, depth), all nearest.
+            // Lighting set: uniforms + G-buffer (albedo, normal, depth) + the 3D
+            // shadow volume, all nearest.
             writeBuffer(vkd, dev, lighting_sets[i], 0, .uniform_buffer, ub, @sizeOf(mesh.Uniforms));
             writeImage(vkd, dev, lighting_sets[i], 1, gbuf_albedo[i].view, sampler_nearest);
             writeImage(vkd, dev, lighting_sets[i], 2, gbuf_normal[i].view, sampler_nearest);
             writeImage(vkd, dev, lighting_sets[i], 3, depth[i].view, sampler_nearest);
+            writeImage(vkd, dev, lighting_sets[i], 4, shadow_volume.view, sampler_nearest);
             // TAA set: uniforms + current lit (nearest) + history = other slot's
-            // resolved (linear, for sub-pixel reprojection) + depth (nearest).
+            // resolved (linear, for sub-pixel reprojection) + depth (nearest). The
+            // shadow volume is bound too (binding 4) only to satisfy the shared layout.
             const other = (i + 1) % max_frames_in_flight;
             writeBuffer(vkd, dev, taa_sets[i], 0, .uniform_buffer, ub, @sizeOf(mesh.Uniforms));
             writeImage(vkd, dev, taa_sets[i], 1, lit[i].view, sampler_nearest);
             writeImage(vkd, dev, taa_sets[i], 2, resolved[other].view, sampler_linear);
             writeImage(vkd, dev, taa_sets[i], 3, depth[i].view, sampler_nearest);
+            writeImage(vkd, dev, taa_sets[i], 4, shadow_volume.view, sampler_nearest);
         }
         //endregion
 
@@ -369,6 +383,7 @@ pub const Renderer = struct {
             .depth = depth,
             .lit = lit,
             .resolved = resolved,
+            .shadow_volume = shadow_volume,
         };
     }
 
@@ -377,6 +392,7 @@ pub const Renderer = struct {
         const dev = ctx.device;
         vkd.deviceWaitIdle(dev) catch {};
 
+        self.shadow_volume.deinit(ctx);
         for (0..max_frames_in_flight) |i| {
             self.gbuf_albedo[i].deinit(ctx);
             self.gbuf_normal[i].deinit(ctx);
@@ -438,6 +454,23 @@ pub const Renderer = struct {
         }
     }
 
+    /// Number of chunks currently resident (for the debug overlay).
+    pub fn chunkCount(self: *const Renderer) usize {
+        return self.chunks.items.len;
+    }
+
+    /// Re-anchor + rebuild the shadow voxel volume around `pos` if the player
+    /// crossed into a new chunk (or `force`, e.g. after streaming). Returns true
+    /// if it rebuilt; cheap no-op otherwise.
+    pub fn recenterShadows(self: *Renderer, ctx: *const Context, world: *World, pos: [3]f32, force: bool) bool {
+        return self.shadow_volume.recenter(ctx, world, pos, force);
+    }
+
+    /// Patch one voxel in the shadow volume after a block edit.
+    pub fn editShadowVoxel(self: *Renderer, ctx: *const Context, world: *World, x: i32, y: i32, z: i32) void {
+        self.shadow_volume.setVoxel(ctx, world, x, y, z);
+    }
+
     /// Mark the active set changed. Cheap — each frame rebuilds its own indirect
     /// commands lazily (see drawFrame).
     pub fn commit(self: *Renderer, ctx: *const Context) !void {
@@ -476,8 +509,9 @@ pub const Renderer = struct {
 
     /// Render and present one frame. `uniforms` carries the camera matrices +
     /// light from the caller; this fills in the framebuffer size, TAA jitter, and
-    /// history-valid flag itself. `planes` drives the GPU frustum cull.
-    pub fn drawFrame(self: *Renderer, ctx: *const Context, swapchain: *const Swapchain, uniforms: mesh.Uniforms, planes: [6][4]f32) !void {
+    /// history-valid flag itself. `planes` drives the GPU frustum cull. `ui_render`,
+    /// if given, records an overlay (ImGui) into a final pass over the swapchain.
+    pub fn drawFrame(self: *Renderer, ctx: *const Context, swapchain: *const Swapchain, uniforms: mesh.Uniforms, planes: [6][4]f32, ui_render: ?*const fn (vk.CommandBuffer) void) !void {
         const vkd = ctx.vkd;
         const dev = ctx.device;
         const frame = self.frames[self.current_frame];
@@ -508,11 +542,15 @@ pub const Renderer = struct {
         const jitter = haltonJitter(self.frame_index, w, h);
         frame_uniforms.params = .{ w, h, jitter[0], jitter[1] };
         frame_uniforms.taa = .{ if (self.frame_index >= max_frames_in_flight) 1.0 else 0.0, 0, 0, 0 };
+        const vv = @import("voxel_volume.zig");
+        const so = self.shadow_volume.origin;
+        frame_uniforms.shadow_origin = .{ @floatFromInt(so[0]), @floatFromInt(so[1]), @floatFromInt(so[2]), 0 };
+        frame_uniforms.shadow_dim = .{ @floatFromInt(vv.dim_x), @floatFromInt(vv.dim_y), @floatFromInt(vv.dim_z), 0 };
         self.uniform_buffers[self.current_frame].write(std.mem.asBytes(&frame_uniforms));
 
         try vkd.resetFences(dev, &.{frame.in_flight});
         try vkd.resetCommandBuffer(frame.cmd, .{});
-        try self.recordFrame(ctx, frame.cmd, swapchain, image_index, planes);
+        try self.recordFrame(ctx, frame.cmd, swapchain, image_index, planes, ui_render);
 
         const wait_stage = vk.PipelineStageFlags{ .color_attachment_output_bit = true };
         try vkd.queueSubmit(ctx.graphics_queue, &.{.{
@@ -540,8 +578,8 @@ pub const Renderer = struct {
         self.frame_index +%= 1;
     }
 
-    /// Record one frame: cull → geometry (G-buffer) → lighting → TAA → present.
-    fn recordFrame(self: *Renderer, ctx: *const Context, cmd: vk.CommandBuffer, swapchain: *const Swapchain, image_index: u32, planes: [6][4]f32) !void {
+    /// Record one frame: cull → geometry (G-buffer) → lighting → TAA → UI → present.
+    fn recordFrame(self: *Renderer, ctx: *const Context, cmd: vk.CommandBuffer, swapchain: *const Swapchain, image_index: u32, planes: [6][4]f32, ui_render: ?*const fn (vk.CommandBuffer) void) !void {
         const vkd = ctx.vkd;
         const f = self.current_frame;
         try vkd.beginCommandBuffer(cmd, &.{});
@@ -658,6 +696,36 @@ pub const Renderer = struct {
         endRendering(vkd, cmd);
         //endregion
 
+        //region UI overlay (ImGui) → swapchain
+        // Draw the debug overlay on top of the resolved image. `load` preserves
+        // the TAA output; a memory barrier makes those writes visible to this pass.
+        if (ui_render) |render_ui| {
+            imageBarrier(vkd, cmd, swapchain.images[image_index], .{
+                .aspect = .{ .color_bit = true },
+                .old_layout = .color_attachment_optimal,
+                .new_layout = .color_attachment_optimal,
+                .src_stage = .{ .color_attachment_output_bit = true },
+                .dst_stage = .{ .color_attachment_output_bit = true },
+                .src_access = .{ .color_attachment_write_bit = true },
+                .dst_access = .{ .color_attachment_write_bit = true, .color_attachment_read_bit = true },
+            });
+            const ui_attachment = [_]vk.RenderingAttachmentInfo{
+                colorAttachmentLoad(swapchain.image_views[image_index]),
+            };
+            beginRendering(vkd, cmd, &.{
+                .render_area = .{ .offset = .{ .x = 0, .y = 0 }, .extent = self.extent },
+                .layer_count = 1,
+                .view_mask = 0,
+                .color_attachment_count = 1,
+                .p_color_attachments = &ui_attachment,
+                .p_depth_attachment = null,
+            });
+            self.setViewportScissor(vkd, cmd);
+            render_ui(cmd);
+            endRendering(vkd, cmd);
+        }
+        //endregion
+
         // Swapchain → presentable; resolved → sampleable for next frame's history.
         imageBarrier(vkd, cmd, swapchain.images[image_index], .{
             .aspect = .{ .color_bit = true },
@@ -710,6 +778,20 @@ fn colorAttachment(view: vk.ImageView, load_op: vk.AttachmentLoadOp, clear: vk.C
         .load_op = load_op,
         .store_op = .store,
         .clear_value = clear,
+    };
+}
+
+/// A colour attachment that preserves existing contents (`load`) — for drawing
+/// the UI overlay on top of the already-resolved swapchain image.
+fn colorAttachmentLoad(view: vk.ImageView) vk.RenderingAttachmentInfo {
+    return .{
+        .image_view = view,
+        .image_layout = .color_attachment_optimal,
+        .resolve_mode = .{},
+        .resolve_image_layout = .undefined,
+        .load_op = .load,
+        .store_op = .store,
+        .clear_value = no_clear,
     };
 }
 

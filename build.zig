@@ -117,6 +117,22 @@ pub fn build(b: *std.Build) void {
     exe.root_module.addImport("vulkan", vulkan.module("vulkan-zig"));
     //endregion
 
+    //region zgui (Dear ImGui — debug UI)
+    // Dear ImGui via zig-gamedev's zgui binding, built with the sdl3_vulkan
+    // backend to match our stack. That backend compiles ImGui's C++ SDL3 +
+    // Vulkan implementations into a static lib we link here; we drive it with
+    // dynamic rendering (a final UI pass over the swapchain — see renderer.zig).
+    // imgui_impl_vulkan.cpp needs the Vulkan headers, hence `vulkan_include`.
+    const zgui = b.dependency("zgui", .{
+        .target = target,
+        .optimize = optimize,
+        .backend = .sdl3_vulkan,
+        .vulkan_include = vulkanIncludePath(b),
+    });
+    exe.root_module.addImport("zgui", zgui.module("root"));
+    exe.root_module.linkLibrary(zgui.artifact("imgui"));
+    //endregion
+
     //region shaders (GLSL -> SPIR-V)
     // Vulkan consumes SPIR-V, not GLSL, so each shader is compiled at build time
     // with `glslc` and embedded into the binary. In source, `@embedFile(name)`
@@ -221,6 +237,13 @@ fn addShader(b: *std.Build, exe: *std.Build.Step.Compile, src: []const u8, impor
     const spv = cmd.addOutputFileArg(b.fmt("{s}.spv", .{import_name}));
     cmd.addFileArg(b.path(src)); // glslc infers the stage from the .vert/.frag extension
     exe.root_module.addAnonymousImport(import_name, .{ .root_source_file = spv });
+}
+
+/// Path to the Vulkan headers directory (`.../include`), for compiling ImGui's
+/// Vulkan backend. Prefers `$VULKAN_SDK/include`; falls back to this dev machine.
+fn vulkanIncludePath(b: *std.Build) []const u8 {
+    if (b.graph.environ_map.get("VULKAN_SDK")) |sdk| return b.pathJoin(&.{ sdk, "include" });
+    return "/Users/kalob/VulkanSDK/1.4.341.1/macOS/include";
 }
 
 /// Locate `glslc`. Prefer the one in the Vulkan SDK (`$VULKAN_SDK/bin`); fall

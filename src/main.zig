@@ -6,6 +6,7 @@ const Swapchain = @import("render/swapchain.zig").Swapchain;
 const Renderer = @import("render/renderer.zig").Renderer;
 const chunkMesh = @import("render/chunk_mesh.zig");
 const Stream = @import("render/stream.zig").Stream;
+const ui = @import("ui.zig");
 
 //region SDL (C interop)
 // Pull SDL's C header straight into Zig. `@cImport` runs the C preprocessor and
@@ -76,6 +77,11 @@ pub fn main(init: std.process.Init) !void {
 
     var renderer = try Renderer.init(&vulkan, &swapchain, capacity, 16384, 24576);
     defer renderer.deinit(&vulkan);
+
+    // Debug overlay (Dear ImGui). Drawn as a final pass over the swapchain; input
+    // is fed from the event loop. Deinit runs before the device is destroyed.
+    ui.init(alloc, &vulkan, &swapchain, @ptrCast(window));
+    defer ui.deinit();
 
     var stream = Stream.init(alloc, &world, &renderer, radius, y_min, y_max);
     defer stream.deinit();
@@ -257,6 +263,23 @@ fn runLoop(
     // to identity; the first frame has its history flagged invalid anyway.
     var prev_viewproj = zig_test.math.Mat4.identity;
 
+    // Debug-overlay state. `ui_focus` releases the mouse for the UI (` toggles);
+    // the light colour/intensity are live-edited in the overlay; FPS is smoothed.
+    var ui_focus = false;
+    var light_rgb = [3]f32{ 1.0, 0.85, 0.6 };
+    var light_intensity: f32 = 3.0;
+    // Sun direction as azimuth (around the horizon) + elevation (above it), in
+    // degrees — live-tuned in the overlay, drives the shadow angle.
+    var sun_azimuth: f32 = 40;
+    var sun_elevation: f32 = 55;
+    var fps_smooth: f32 = 60.0;
+    var fps_window: f64 = 0; // time since the displayed FPS was last refreshed
+
+    // Shadow-volume sync: rebuild on chunk crossings, plus a debounced refresh
+    // while the resident set is still changing (chunks streaming in).
+    var last_shadow_chunks: usize = 0;
+    var shadow_timer: u32 = 0;
+
     // Capture the mouse so motion turns the camera (like any FPS). This hides
     // the cursor and lets us read raw relative motion instead of an absolute
     // position pinned to the window edge.
@@ -275,22 +298,39 @@ fn runLoop(
         //    STATE below.
         var event: c.SDL_Event = undefined;
         while (c.SDL_PollEvent(&event)) {
+            // Let ImGui see every event first (mouse/keyboard for the overlay).
+            _ = ui.processEvent(&event);
             switch (event.type) {
                 c.SDL_EVENT_QUIT => running = false,
                 c.SDL_EVENT_KEY_DOWN => {
                     if (event.key.key == c.SDLK_ESCAPE) running = false;
+                    // Backtick (`) releases the mouse to interact with the overlay
+                    // (and back). Kept off Tab, which ImGui uses for widget nav.
+                    // Scancode, so it fires on the physical key with or without shift.
+                    if (event.key.scancode == c.SDL_SCANCODE_GRAVE) {
+                        ui_focus = !ui_focus;
+                        _ = c.SDL_SetWindowRelativeMouseMode(window, !ui_focus);
+                    }
                 },
                 c.SDL_EVENT_MOUSE_MOTION => {
                     // `xrel`/`yrel` are how far the mouse moved since last event.
-                    cam.look(event.motion.xrel, event.motion.yrel);
+                    if (!ui_focus) cam.look(event.motion.xrel, event.motion.yrel);
                 },
                 c.SDL_EVENT_MOUSE_BUTTON_DOWN => {
                     // Aim a ray from the camera; left = break, right = place.
-                    if (zig_test.raycast.raycastVoxel(stream.world, cam.position, cam.forward(), 6.0)) |h| {
-                        if (event.button.button == c.SDL_BUTTON_LEFT) {
-                            try stream.editBlock(vulkan, h.block[0], h.block[1], h.block[2], .air);
-                        } else if (event.button.button == c.SDL_BUTTON_RIGHT) {
-                            try stream.editBlock(vulkan, h.block[0] + h.normal[0], h.block[1] + h.normal[1], h.block[2] + h.normal[2], .stone);
+                    // Skipped while the overlay has the mouse.
+                    if (!ui_focus) {
+                        if (zig_test.raycast.raycastVoxel(stream.world, cam.position, cam.forward(), 6.0)) |h| {
+                            if (event.button.button == c.SDL_BUTTON_LEFT) {
+                                try stream.editBlock(vulkan, h.block[0], h.block[1], h.block[2], .air);
+                                renderer.editShadowVoxel(vulkan, stream.world, h.block[0], h.block[1], h.block[2]);
+                            } else if (event.button.button == c.SDL_BUTTON_RIGHT) {
+                                const px = h.block[0] + h.normal[0];
+                                const py = h.block[1] + h.normal[1];
+                                const pz = h.block[2] + h.normal[2];
+                                try stream.editBlock(vulkan, px, py, pz, .stone);
+                                renderer.editShadowVoxel(vulkan, stream.world, px, py, pz);
+                            }
                         }
                     }
                 },
@@ -302,7 +342,8 @@ fn runLoop(
         //    Unlike events, this tells us what's held RIGHT NOW — exactly what
         //    continuous movement needs. SDL owns the array; we just read it.
         const keys = c.SDL_GetKeyboardState(null);
-        const move = readMovement(keys);
+        // No player movement while the overlay has focus (so typing/clicks don't walk).
+        const move = if (ui_focus) Movement{ .x = 0, .y = 0, .z = 0, .sprint = false } else readMovement(keys);
 
         // 4. Physics: step the player on a fixed timestep (stable collision),
         //    then place the camera at its eyes. Look stays per-frame (mouse).
@@ -321,9 +362,43 @@ fn runLoop(
         //     the player crossed into a new chunk.
         try stream.update(vulkan, cam.position);
 
+        // 4c. Shadow volume: re-anchor on chunk crossings; also force a debounced
+        //     rebuild while chunks are still streaming in (resident count moving).
+        shadow_timer += 1;
+        const shadow_chunks = renderer.chunkCount();
+        const force_shadows = shadow_chunks != last_shadow_chunks and shadow_timer >= 30;
+        if (renderer.recenterShadows(vulkan, stream.world, .{ cam.position.x, cam.position.y, cam.position.z }, force_shadows)) {
+            last_shadow_chunks = shadow_chunks;
+            shadow_timer = 0;
+        }
+
         // 5. Render: build the shared per-frame uniforms and draw the world.
         //    Vertices are chunk-local; each chunk's world origin is a push
         //    constant, so we only need view × projection here (no model matrix).
+        // Debug overlay: start an ImGui frame and build the window. Must be paired
+        // with the `ui.record` callback in drawFrame below (which finalises it).
+        // `fps_smooth` is a windowed average (updated below), not a per-frame 1/dt —
+        // so a stall (e.g. a chunk-load rebuild) and its vsync catch-up frames
+        // average out instead of spiking the reading.
+        ui.beginFrame(swapchain.extent.width, swapchain.extent.height);
+        ui.debugWindow(.{
+            .fps = fps_smooth,
+            .cam_pos = .{ cam.position.x, cam.position.y, cam.position.z },
+            .yaw = cam.yaw,
+            .pitch = cam.pitch,
+            .chunks = renderer.chunkCount(),
+            .light_rgb = &light_rgb,
+            .light_intensity = &light_intensity,
+            .sun_azimuth = &sun_azimuth,
+            .sun_elevation = &sun_elevation,
+        });
+
+        // Sun direction from the overlay's azimuth/elevation (points toward the sun).
+        const el = std.math.degreesToRadians(sun_elevation);
+        const az = std.math.degreesToRadians(sun_azimuth);
+        const cos_el = @cos(el);
+        const sun_dir = [3]f32{ cos_el * @cos(az), @sin(el), cos_el * @sin(az) };
+
         const math = zig_test.math;
         const aspect: f32 = @as(f32, @floatFromInt(swapchain.extent.width)) /
             @as(f32, @floatFromInt(swapchain.extent.height));
@@ -341,18 +416,26 @@ fn runLoop(
             .inv_viewproj = viewproj.inverse().m,
             .prev_viewproj = prev_viewproj.m,
             .light_pos = .{ cam.position.x, cam.position.y, cam.position.z, 0 },
-            .light_color = .{ 1.0, 0.85, 0.6, 3.0 },
+            .light_color = .{ light_rgb[0], light_rgb[1], light_rgb[2], light_intensity },
             .camera_pos = .{ cam.position.x, cam.position.y, cam.position.z, 0 },
             .params = .{ 0, 0, 0, 0 },
             .taa = .{ 0, 0, 0, 0 },
-        }, planes);
+            // Filled in by the renderer from its shadow volume.
+            .shadow_origin = .{ 0, 0, 0, 0 },
+            .shadow_dim = .{ 0, 0, 0, 0 },
+            .sun_dir = .{ sun_dir[0], sun_dir[1], sun_dir[2], 0 },
+        }, planes, ui.record);
         prev_viewproj = viewproj;
 
-        // Once-a-second readout: FPS plus the camera's position and look angles,
-        // so we can watch WASD + mouse actually driving the camera with no
-        // renderer yet.
+        // Windowed FPS: average frames over a short interval (steady, unlike a
+        // per-frame 1/dt), used by the overlay and the once-a-second console line.
         fps_accum += dt;
         fps_frames += 1;
+        fps_window += dt;
+        if (fps_window >= 0.25) {
+            fps_smooth = @as(f32, @floatFromInt(fps_frames)) / @as(f32, @floatCast(fps_accum));
+            fps_window = 0;
+        }
         if (fps_accum >= 1.0) {
             std.debug.print(
                 "fps: {d} | pos ({d:.1}, {d:.1}, {d:.1}) | yaw {d:.2} pitch {d:.2}\n",

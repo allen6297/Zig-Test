@@ -9,3 +9,6 @@ zig-out/
 
 # macOS metadata
 .DS_Store
+
+# Dear ImGui writes window layout here at runtime
+imgui.ini

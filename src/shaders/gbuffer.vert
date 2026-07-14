@@ -21,6 +21,9 @@ layout(binding = 0) uniform Uniforms {
     vec4 camera_pos;
     vec4 params; // xy = resolution (px), zw = jitter (NDC)
     vec4 taa;    // x = history valid
+    vec4 shadow_origin;
+    vec4 shadow_dim;
+    vec4 sun_dir;
 } u;
 
 layout(std430, binding = 1) readonly buffer ChunkOrigins {
