@@ -10,7 +10,8 @@
 //!   bits 12..17  z
 //!   bits 18..20  normal / face direction (0..5)
 //!   bits 21..28  block id (0..255)
-//!   bits 29..31  spare (ambient occlusion later)
+//!   bits 29..30  ambient occlusion (0 = darkest .. 3 = brightest)
+//!   bit  31      spare
 
 const vk = @import("vulkan");
 
@@ -40,10 +41,10 @@ pub const Face = enum(u3) {
     neg_z = 5,
 };
 
-/// Pack one vertex. Coordinates are chunk-local (0..16).
-pub fn pack(x: u32, y: u32, z: u32, face: Face, block: u32) Vertex {
+/// Pack one vertex. Coordinates are chunk-local (0..16); `ao` is 0..3.
+pub fn pack(x: u32, y: u32, z: u32, face: Face, block: u32, ao: u32) Vertex {
     return .{ .data = x | (y << 6) | (z << 12) |
-        (@as(u32, @intFromEnum(face)) << 18) | (block << 21) };
+        (@as(u32, @intFromEnum(face)) << 18) | (block << 21) | (ao << 29) };
 }
 
 /// Per-frame shader data, shared by every chunk. Laid out to match the shader's

@@ -15,9 +15,20 @@ const BlockId = @import("block.zig").BlockId;
 
 pub const Coord = struct { x: i32, y: i32, z: i32 };
 
+/// Player edits for one chunk, keyed by local block index (lx + ly*16 + lz*256).
+/// Applied on top of generated terrain, so edits survive chunk eviction and can
+/// be saved to disk. This is the world's *diff* from its deterministic gen.
+const ChunkEdits = std.AutoHashMap(u16, BlockId);
+
+fn localIndex(lx: usize, ly: usize, lz: usize) u16 {
+    return @intCast(lx + ly * chunk_size + lz * chunk_size * chunk_size);
+}
+
 pub const World = struct {
     allocator: std.mem.Allocator,
     chunks: std.AutoHashMap(Coord, *Chunk),
+    /// Persistent per-chunk edits (survive eviction; saved/loaded to disk).
+    edits: std.AutoHashMap(Coord, ChunkEdits),
     /// Fills a freshly-allocated chunk from its coordinate. Null → air chunks.
     generator: ?*const fn (Coord, *Chunk) void = null,
 
@@ -25,6 +36,7 @@ pub const World = struct {
         return .{
             .allocator = allocator,
             .chunks = std.AutoHashMap(Coord, *Chunk).init(allocator),
+            .edits = std.AutoHashMap(Coord, ChunkEdits).init(allocator),
             .generator = generator,
         };
     }
@@ -33,15 +45,26 @@ pub const World = struct {
         var it = self.chunks.valueIterator();
         while (it.next()) |chunk| self.allocator.destroy(chunk.*);
         self.chunks.deinit();
+        var eit = self.edits.valueIterator();
+        while (eit.next()) |em| em.deinit();
+        self.edits.deinit();
     }
 
-    /// Generate (if needed) and return the chunk at a coordinate.
+    /// Generate (if needed) and return the chunk at a coordinate. Generated
+    /// terrain has this chunk's saved edits re-applied on top.
     pub fn ensure(self: *World, coord: Coord) !*Chunk {
         const gop = try self.chunks.getOrPut(coord);
         if (!gop.found_existing) {
             const chunk = try self.allocator.create(Chunk);
             chunk.* = Chunk.initAir();
             if (self.generator) |gen| gen(coord, chunk);
+            if (self.edits.get(coord)) |em| {
+                var it = em.iterator();
+                while (it.next()) |e| {
+                    const idx = e.key_ptr.*;
+                    chunk.set(idx % chunk_size, (idx / chunk_size) % chunk_size, idx / (chunk_size * chunk_size), e.value_ptr.*);
+                }
+            }
             gop.value_ptr.* = chunk;
         }
         return gop.value_ptr.*;
@@ -89,21 +112,84 @@ pub const World = struct {
         );
     }
 
-    /// Set a block at a global coordinate, generating its chunk if needed.
+    /// Set a block at a global coordinate, generating its chunk if needed, and
+    /// record it as a persistent edit.
     pub fn setBlock(self: *World, wx: i32, wy: i32, wz: i32, block: BlockId) !void {
-        const chunk = try self.ensure(.{
+        const coord = Coord{
             .x = @divFloor(wx, chunk_size),
             .y = @divFloor(wy, chunk_size),
             .z = @divFloor(wz, chunk_size),
-        });
-        chunk.set(
-            @intCast(@mod(wx, chunk_size)),
-            @intCast(@mod(wy, chunk_size)),
-            @intCast(@mod(wz, chunk_size)),
-            block,
-        );
+        };
+        const lx: usize = @intCast(@mod(wx, chunk_size));
+        const ly: usize = @intCast(@mod(wy, chunk_size));
+        const lz: usize = @intCast(@mod(wz, chunk_size));
+
+        const chunk = try self.ensure(coord);
+        chunk.set(lx, ly, lz, block);
+
+        // Record the edit so it survives eviction and can be saved.
+        const gop = try self.edits.getOrPut(coord);
+        if (!gop.found_existing) gop.value_ptr.* = ChunkEdits.init(self.allocator);
+        try gop.value_ptr.put(localIndex(lx, ly, lz), block);
+    }
+
+    /// Serialize all edits to a compact binary diff (caller frees). Cheap — only
+    /// *changes* are stored; the deterministic generator reproduces the rest.
+    /// Pure (no file I/O) so `World` stays independent of the platform layer;
+    /// `main` writes the bytes to disk.
+    pub fn serialize(self: *World, allocator: std.mem.Allocator) ![]u8 {
+        var bytes = std.ArrayList(u8).empty;
+        errdefer bytes.deinit(allocator);
+        var cit = self.edits.iterator();
+        while (cit.next()) |entry| {
+            const coord = entry.key_ptr.*;
+            const em = entry.value_ptr;
+            try appendInt(&bytes, allocator, i32, coord.x);
+            try appendInt(&bytes, allocator, i32, coord.y);
+            try appendInt(&bytes, allocator, i32, coord.z);
+            try appendInt(&bytes, allocator, u32, em.count());
+            var it = em.iterator();
+            while (it.next()) |e| {
+                try appendInt(&bytes, allocator, u16, e.key_ptr.*);
+                try appendInt(&bytes, allocator, u16, @intFromEnum(e.value_ptr.*));
+            }
+        }
+        return bytes.toOwnedSlice(allocator);
+    }
+
+    /// Load edits from serialized bytes (from `serialize`).
+    pub fn deserialize(self: *World, data: []const u8) !void {
+        var i: usize = 0;
+        while (i + 16 <= data.len) {
+            const coord = Coord{
+                .x = readInt(data, &i, i32),
+                .y = readInt(data, &i, i32),
+                .z = readInt(data, &i, i32),
+            };
+            const count = readInt(data, &i, u32);
+            const gop = try self.edits.getOrPut(coord);
+            if (!gop.found_existing) gop.value_ptr.* = ChunkEdits.init(self.allocator);
+            var n: u32 = 0;
+            while (n < count and i + 4 <= data.len) : (n += 1) {
+                const idx = readInt(data, &i, u16);
+                const block: BlockId = @enumFromInt(readInt(data, &i, u16));
+                try gop.value_ptr.put(idx, block);
+            }
+        }
     }
 };
+
+fn appendInt(list: *std.ArrayList(u8), gpa: std.mem.Allocator, comptime T: type, v: T) !void {
+    var buf: [@sizeOf(T)]u8 = undefined;
+    std.mem.writeInt(T, &buf, v, .little);
+    try list.appendSlice(gpa, &buf);
+}
+
+fn readInt(data: []const u8, i: *usize, comptime T: type) T {
+    const v = std.mem.readInt(T, data[i.*..][0..@sizeOf(T)], .little);
+    i.* += @sizeOf(T);
+    return v;
+}
 
 test "blockAt reads across chunk boundaries and returns air outside" {
     var world = World.init(std.testing.allocator, null);
@@ -124,4 +210,32 @@ test "evict frees a chunk" {
     try std.testing.expect(world.isResident(.{ .x = 0, .y = 0, .z = 0 }));
     world.evict(.{ .x = 0, .y = 0, .z = 0 });
     try std.testing.expect(!world.isResident(.{ .x = 0, .y = 0, .z = 0 }));
+}
+
+test "edits survive chunk eviction (regenerated with the edit)" {
+    var world = World.init(std.testing.allocator, null); // null gen → air chunks
+    defer world.deinit();
+    try world.setBlock(5, 5, 5, .stone);
+    world.evict(.{ .x = 0, .y = 0, .z = 0 }); // drop the cached chunk
+    _ = try world.ensure(.{ .x = 0, .y = 0, .z = 0 }); // regenerate (air) + re-apply edit
+    try std.testing.expectEqual(BlockId.stone, world.blockAt(5, 5, 5));
+}
+
+test "edits round-trip through serialize/deserialize" {
+    const a = std.testing.allocator;
+    var w1 = World.init(a, null);
+    defer w1.deinit();
+    try w1.setBlock(3, 4, 5, .dirt);
+    try w1.setBlock(-1, 20, -33, .grass); // spans negative + multiple chunks
+    const bytes = try w1.serialize(a);
+    defer a.free(bytes);
+
+    var w2 = World.init(a, null);
+    defer w2.deinit();
+    try w2.deserialize(bytes);
+    // Generate the containing chunks so the loaded edits get applied.
+    _ = try w2.ensure(.{ .x = 0, .y = 0, .z = 0 });
+    _ = try w2.ensure(.{ .x = -1, .y = 1, .z = -3 });
+    try std.testing.expectEqual(BlockId.dirt, w2.blockAt(3, 4, 5));
+    try std.testing.expectEqual(BlockId.grass, w2.blockAt(-1, 20, -33));
 }

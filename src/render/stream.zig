@@ -11,6 +11,7 @@ const zig_test = @import("zig_test");
 const World = zig_test.world.World;
 const Coord = zig_test.world.Coord;
 const Vec3 = zig_test.math.Vec3;
+const BlockId = zig_test.block.BlockId;
 const chunk_size = zig_test.chunk.size;
 const chunkMesh = @import("chunk_mesh.zig");
 const Renderer = @import("renderer.zig").Renderer;
@@ -144,6 +145,62 @@ pub const Stream = struct {
             };
             try self.resident.put(coord, slot);
         }
+    }
+
+    /// Apply a single block edit and re-mesh the affected chunk(s). This is the
+    /// **one place** world mutation happens — the seed of the server's
+    /// authoritative "apply action" handler. Edits are in-memory only for now;
+    /// they're lost if the chunk is evicted (persistence is a later step).
+    pub fn editBlock(self: *Stream, ctx: *const Context, wx: i32, wy: i32, wz: i32, block: BlockId) !void {
+        try self.world.setBlock(wx, wy, wz, block);
+
+        const cx = @divFloor(wx, chunk_size);
+        const cy = @divFloor(wy, chunk_size);
+        const cz = @divFloor(wz, chunk_size);
+        const lx = @mod(wx, chunk_size);
+        const ly = @mod(wy, chunk_size);
+        const lz = @mod(wz, chunk_size);
+
+        // The chunk containing the edit, plus any neighbour across a boundary the
+        // edited block sits on (its faces toward the edit changed).
+        try self.remeshResident(.{ .x = cx, .y = cy, .z = cz });
+        if (lx == 0) try self.remeshResident(.{ .x = cx - 1, .y = cy, .z = cz });
+        if (lx == chunk_size - 1) try self.remeshResident(.{ .x = cx + 1, .y = cy, .z = cz });
+        if (ly == 0) try self.remeshResident(.{ .x = cx, .y = cy - 1, .z = cz });
+        if (ly == chunk_size - 1) try self.remeshResident(.{ .x = cx, .y = cy + 1, .z = cz });
+        if (lz == 0) try self.remeshResident(.{ .x = cx, .y = cy, .z = cz - 1 });
+        if (lz == chunk_size - 1) try self.remeshResident(.{ .x = cx, .y = cy, .z = cz + 1 });
+
+        try self.renderer.commit(ctx);
+    }
+
+    /// Re-mesh a chunk that's already resident (skip if not loaded). Handles
+    /// empty↔non-empty transitions (a placed block can fill an empty chunk, a
+    /// dug-out one can empty it).
+    fn remeshResident(self: *Stream, coord: Coord) !void {
+        const old = self.resident.get(coord) orelse return; // not loaded
+        if (old == pending_slot) return; // queued load will mesh the edited state
+
+        try self.ensureForMesh(coord);
+        var m = try chunkMesh.build(self.allocator, self.world, coord.x, coord.y, coord.z);
+        defer m.deinit(self.allocator);
+
+        if (old != empty_slot) self.renderer.removeChunkBySlot(old);
+        if (m.indices.len == 0) {
+            try self.resident.put(coord, empty_slot);
+            return;
+        }
+        const origin = [3]f32{
+            @floatFromInt(coord.x * chunk_size),
+            @floatFromInt(coord.y * chunk_size),
+            @floatFromInt(coord.z * chunk_size),
+        };
+        const slot = self.renderer.addChunk(m, origin) orelse {
+            std.log.warn("remesh: chunk pool full", .{});
+            try self.resident.put(coord, empty_slot);
+            return;
+        };
+        try self.resident.put(coord, slot);
     }
 
     /// Ensure the chunk and its 6 face-neighbours are generated, so the mesher

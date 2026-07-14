@@ -2,13 +2,46 @@
 
 A 3D voxel game experiment inspired by [Cubyz](https://github.com/PixelGuys/Cubyz).
 
-This is my first time coding in Zig, and this is only a test — a sandbox to try out
-ideas and learn the language, not the final project.
+**The game:** a **voxel zombie-survival** game. Scavenge the world for resources,
+craft and upgrade weapons, and grow stronger while surviving the undead. Backed by
+simulation systems — **water**, **power**, and more — with light tech/automation
+and combat woven into a survival core.
+
+This is my first time coding in Zig, and this repo is a learning sandbox/prototype
+for the engine that game will run on — not the final project.
 
 ## Goals
 - Use open source libraries
 - Vulkan rendering pipeline
 - Easy modding support
+- **Multiplayer** (authoritative server + replicated client — see Architecture)
+
+## Direction
+
+**Genre:** voxel **zombie-survival**. Core loop: **scavenge → craft/upgrade →
+grow stronger → survive**. Survival is the primary pillar; tech and combat serve it.
+
+- **Survival (primary):** resource scavenging, crafting + weapon upgrades, player
+  progression, hunger/thirst-style needs, base building + defense, day/night
+  danger (zombies).
+- **Combat:** zombies as the core threat — enemy AI, melee/ranged weapons,
+  weapon crafting + upgrade progression.
+- **Tech / simulation systems:** **water** (flow/pressure) and **power**
+  (generation/distribution to run devices) as first-class world systems, plus
+  lighter automation. These run on the fixed simulation tick (see Architecture).
+
+Systems this implies (slot into the server-side `simulate()` tick): worldgen +
+scavenge-able resources, inventory/crafting, mob AI + combat, fluid simulation,
+a power network, and persistence. All supported by the tick + authoritative-server
+spine already planned.
+
+- **Platforms:** multiplatform — Windows, Linux (incl. dedicated servers), macOS.
+- **Block art: no textures.** Flat per-face colours only. Richness comes from
+  *lighting + atmosphere + geometric detail* — the **John Lin / micro-voxel look**:
+  colored voxels lit by GI, not textured cubes. Textures would fight this cohesive,
+  painterly style, so the visual budget goes into lighting and atmosphere instead.
+  The near-term wins are **per-vertex ambient occlusion** (baked into the mesh) and
+  **fog/sky/tonemapping**; the endgame is raymarched voxel GI (see Lighting).
 
 ## Rendering
 - Chunk LODs
@@ -86,8 +119,17 @@ Zig concepts along the way.
 - [ ] Procedural terrain (real noise instead of the sine heightmap → 3D caves)
 
 ### 3. Gameplay
-- [ ] Break / place blocks via raycasting
-- [ ] AABB collision + gravity
+- [x] Break / place blocks via raycasting — DDA voxel raycast (`src/raycast.zig`),
+      `Stream.editBlock` re-meshes the edited chunk + boundary neighbours (the
+      seed of the server's authoritative "apply action"). Left-click break,
+      right-click place.
+- [x] World persistence — edits stored as a per-chunk diff in `World` (survives
+      eviction; re-applied on regen), serialized to `world.sav` on exit / loaded
+      on start (`serialize`/`deserialize`; file I/O in `main`). Player position +
+      look persist too (`player.sav`).
+- [x] AABB collision + gravity — walking `Player` (`src/player.zig`): swept
+      per-axis AABB-vs-voxel collision (slides along walls, no tunnelling),
+      gravity + jump, on a **fixed 60 Hz physics step**; camera rides its eyes.
 - [ ] Day/night cycle
 
 ### 4. Immersive rendering
@@ -194,30 +236,114 @@ fly around with WASD + mouse-look.
    draw. Culled chunks cost nothing. Per-frame indirect buffers avoid in-flight
    hazards. First compute shader in the project.
 
+## Architecture — simulation & multiplayer
+
+The load-bearing decisions everything else hangs off. Decided early because they're
+cheap now and a rewrite later.
+
+**Fixed-timestep simulation.** Game logic runs on a **fixed tick** (start at ~30 Hz),
+decoupled from variable-rate rendering, via an accumulator loop:
+```
+accumulator += frame_dt
+while accumulator >= TICK: { prev = state; simulate(TICK); accumulator -= TICK }
+render(lerp(prev, state, accumulator / TICK))   // interpolate for smoothness
+```
+- **On ticks:** block updates, fluids, mob AI, entity/contraption physics, mod
+  `on_tick` (this is what makes Lua coroutines' "wait N ticks" real).
+- **On frames:** rendering, camera + input sampling (mouse-look must stay
+  responsive), UI, chunk streaming.
+- Keep `simulate()` a clean seam even while empty. A slow game-tick / fast
+  physics-tick split can come later.
+
+**Authoritative server + replicated client (multiplayer is a goal).** Even
+single-player is built as an **integrated server + client in one process**, so MP
+is a transport swap, not a rewrite (Minecraft's model):
+- **Server** owns world truth, runs `simulate()`, validates all actions, manages
+  chunks, runs behaviour mods. Never trusts a client.
+- **Client** renders a replicated view, samples input, **sends actions** (break
+  block, move intent), **receives state** (block changes, entity positions),
+  meshes replicated chunks. Never mutates the world directly.
+- **The boundary is one transport-agnostic `Connection`** (in-process channel for
+  SP → network socket for MP). If world mutation only ever happens on the server
+  side of it, we're MP-ready structurally before any networking exists.
+
+Where current systems land: World + simulation → **server**; renderer/pool/cull +
+camera/UI → **client**; streaming **splits** (server decides what to send; client
+receives + meshes). Model = **authoritative replication, not lockstep** (simpler).
+Networking (later): **ENet** (reliable UDP + channels) — block changes reliable,
+entity spam unreliable; client-side prediction + entity interpolation for latency.
+Deterministic `genChunk` is a big win: clients generate base terrain locally, so
+the server only sends **edits (deltas)** — major bandwidth savings.
+
+Build order: (1) now — fixed-tick loop + in-process client/server split, no
+networking; (2) later — ENet transport behind the same `Connection`; (3) last —
+prediction/interpolation once real latency exists. Caveat: MP voxel networking
+(chunk sync, bandwidth, prediction, anti-cheat) is one of the hardest parts of the
+whole project — but *structuring* for it now is cheap; the hard parts wait.
+
 ## Lighting
 
 Goal: **real dynamic, coloured lights** — not baked/Minecraft-style flood-fill.
-Two orthogonal problems: (a) shading efficiently with many lights, (b) shadows /
-visibility. Because the world is voxels, it's already a ray-acceleration
-structure — we raymarch the grid (DDA) rather than use hardware RT (MoltenVK's
-`VK_KHR_ray_tracing` support is unreliable; software raymarching suits voxels
-better anyway). Reference point: Teardown (voxels + raymarched lighting + temporal
-accumulation, no RT hardware).
+Two problems: (a) shading many lights efficiently → **deferred** (a G-buffer, so
+lighting cost is per-pixel not per-object); (b) shadows + GI → **raymarch the voxel
+grid**. Because the world is voxels it's already a ray-acceleration structure, so we
+DDA-march it rather than use hardware RT (MoltenVK's `VK_KHR_ray_tracing` support is
+unreliable; software raymarching suits voxels better anyway). Reference: Teardown
+(voxels + raymarched lighting + temporal accumulation, no RT hardware).
 
-Phased plan (each independently visible):
-1. [x] **Real per-pixel lighting** — N·L Lambert from one dynamic coloured point
-   light with inverse-square falloff (real normals + world position in the
-   shaders; uniforms carry `model`, `light_pos`, `light_color`). A warm light
-   orbits the terrain.
-2. **Clustered forward** — froxel light grid + compute cull → hundreds of dynamic
-   coloured point lights; works with transparency (water).
-3. **Raymarched shadows** — upload the voxel volume to the GPU (3D texture /
-   storage buffer, later a brickmap/SDF), DDA shadow rays for hard dynamic shadows.
-4. **Temporal GI** — coloured bounce + emissive blocks (lava/lamps), accumulated
-   and denoised over frames.
+**Target architecture: hybrid deferred + raymarched.** Rasterise the greedy mesh
+for *primary visibility* (cheap, reuses pool/cull/indirect), then *raymarch the
+voxel grid for the lighting* (shadows + GI). Each technique for its strength:
+raster = "what's visible", raymarch = "how it's lit".
 
-Note: fully dynamic lighting bakes *nothing* into the mesh, so it removes the
-per-vertex-AO constraint on greedy meshing — the two plans reinforce each other.
+```
+[greedy mesh]  --rasterise-->  G-buffer (world pos, normal, albedo, material)
+                                   |
+[voxel volume] <--march rays--  lighting pass (shadows + GI)   <- reduced res +
+                                   |                               temporal accum
+                            composite + fog + tonemap  -->  screen
+```
+Two GPU copies of the world, both from the same chunk blocks, kept in sync on edit:
+the **meshes** (rasterised) and a **voxel volume** (3D texture / brickmap, sampled
+by rays). Note: deferred + raymarched lighting means **MSAA → TAA** (temporal AA,
+which shares the GI's temporal accumulation).
+
+Phases (each independently visible):
+1. [x] **Forward per-pixel lighting** — N·L Lambert from one dynamic coloured point
+   light with falloff + per-vertex AO. (Current renderer.)
+2. **Go deferred** — split shading into a G-buffer pass + a lighting pass; swap
+   MSAA for TAA. (Gateway refactor; no raymarching yet — well-contained.)
+3. **Voxel volume on GPU** — upload chunk blocks as a 3D texture / brickmap (sparse
+   + distance LOD so rays skip empty space), kept in sync with the mesh.
+4. **Raymarched shadows** — DDA shadow rays from G-buffer points → hard dynamic
+   shadows for any light. First big payoff.
+5. **Raymarched GI** — hemisphere rays for coloured bounce + emissive blocks
+   (lava/lamps), with temporal accumulation + denoise. The Teardown look.
+
+Note on AO: raymarched GI (phase 5) provides ambient occlusion "for free," but
+that's far off — so we bake **per-vertex AO** into the mesh *now* for the soft,
+grounded look (done). It constrains greedy merging slightly (only merge quads whose
+corner-AO matches) and is *superseded* by GI later — an accepted near-term trade.
+
+## Atmosphere & look
+
+The reference aesthetic (textureless colored voxels, John Lin / "Micro Voxel
+Engine" style) gets its beauty from **lighting + atmosphere**, not textures. Beyond
+the Lighting phases, the pieces that turn "colored cubes" into that painterly look:
+- **Distance fog** (and optional height fog) — the hazy depth that ties the scene
+  together. Cheap, high impact; do early.
+- **Sky + sun** — a gradient sky and a soft directional sun light (warm at
+  sunrise/sunset), driving the day/night cycle.
+- **Tonemapping / colour grading** — a post-process for the filmic, warm look; the
+  raw lit colours aren't the final image.
+- [x] **Ambient occlusion** — per-vertex AO baked in the greedy mesher
+  (`chunk_mesh.zig`): 4-corner darkening from air-side occluders, packed into 2
+  vertex bits, merge-gated so AO isn't smeared, with the diagonal-flip fix.
+  Applied in the shader (modulates ambient fully, direct a little). Replaced by GI
+  later.
+- **Decorative voxel detail** — grass tufts, bushes, foliage as many small
+  blocks/instances (the "78k entities" in the reference): detail via *geometry*,
+  not textures.
 
 ## Contraptions (moving block assemblies) — later feature
 
@@ -281,5 +407,77 @@ touching code. This is a reason to keep player UI custom (ImGui is code-driven).
 
 Plan: add `zgui` for tools now; build the custom data-driven UI (optionally
 Clay-backed) for the game later.
+
+## Modding
+
+Two layers, matching how mods actually work:
+
+**Data mods** (new blocks, recipes, textures, worldgen params) → **ZON or JSON**,
+loaded at runtime. No runtime/VM needed; Zig parses both natively. This covers the
+*majority* of modding.
+
+**Behavior mods** (custom logic: machines, mob AI, contraption controllers) →
+**embedded Lua** (via `ziglua`/`zlua`). Chosen over JS (QuickJS) and Wren because:
+- **Language fit:** Lua **coroutines** map directly onto tick-based game logic
+  (`do X; wait 5 ticks; do Y`), whereas JS's event-loop/`async` model fights a
+  frame loop. Lua 5.4 also has **real integers** (block ids, coords, bit-packing);
+  JS is all `f64`.
+- **Best Zig binding** of the candidates (`ziglua` is mature/active).
+- **Game-modding precedent + familiarity:** the people likely to mod a voxel game
+  already skew Lua-literate (Factorio, Roblox/Luau, Gmod, Don't Starve, …).
+
+Sandbox Lua *sensibly* for a curated mod community: strip dangerous stdlib
+(`os.execute`, `io`, `os.remove`) and cap memory/instructions. That covers
+accidents + casual mischief. If untrusted, download-from-anywhere mods ever become
+a requirement, escalate to **Luau** (typed, sandbox-hardened Lua — same mental
+model) or a WASM runtime (strong sandbox + any-language, at the cost of a compile
+step and pointer/length marshaling). Not needed up front.
+
+The real work either way is the **mod API surface** (`place_block`,
+`register_block`, `on_tick`, …) — that boundary is largely the same regardless of
+which VM backs it, so starting with Lua doesn't lock us out of WASM later.
+
+## Entities / ECS
+
+**Entities** = dynamic things (player, zombies, dropped items, projectiles,
+contraptions). **Blocks are NOT entities** — they live in the chunk voxel grid
+(dense); entities are the sparse dynamic layer on top. An entity is a set of
+**components** (data: `Position`, `Velocity`, `Health`, `ZombieAI`, `Inventory`,
+`Renderable`); **systems** (functions) iterate all entities with a given component
+set. Composition over inheritance — a burning zombie is just `Zombie + Burning`.
+
+Decision: **roll our own simple sparse-set ECS** (comptime Zig) rather than adopt a
+framework up front — this is a learning prototype, a sparse-set ECS is little code,
+it stays pure-Zig, and building it teaches how an ECS works. Keep systems decoupled
+from storage so it's **swappable**: graduate to **`zflecs`** (zig-gamedev's flecs
+binding) later *only if* a real need appears — flecs' relationships (inventory
+*contains* item, contraption *parent-of* blocks), prefabs, and query/perf scale for
+thousands of zombies are its payoff, at the cost of a big C dependency + learning
+its framework.
+
+Fit to the architecture:
+- **Server-side + on the fixed tick.** Systems run in `simulate(TICK)` (AI,
+  physics, movement). Clients get **replicated components** (Position, Health,
+  animation) for rendering + interpolation; server-only components stay server-side.
+- **Spatial by chunk** — index entities by chunk for near-me queries (targeting,
+  collision) and to replicate only entities in a client's loaded radius.
+- **Entity ↔ voxel** — collision/pathfinding query `world.blockAt`; the grid makes
+  voxel collision cheap (swept-AABB).
+- **Build it when the first entity appears** (the player as a moving entity, once
+  the fixed-tick loop exists) — not as an empty framework beforehand.
+
+Implementation shape (~100 lines of pure Zig):
+- **`Store(T)`** — a sparse set per component type: a packed `dense` array of
+  values (cache-friendly iteration) + a parallel `owners: []Entity` + a
+  `sparse: Entity→index` map. `set`/`get`/`remove` (swap-remove keeps `dense`
+  packed). ~30 lines.
+- **`Ecs(&.{ Position, Velocity, Health, … })`** — comptime-generates one
+  `Store(T)` per listed component + an entity-id counter; `world.store(Position)`
+  resolves to the right typed store at compile time (no runtime registration
+  ceremony). ~40 lines.
+- **Systems** are plain functions that iterate one store and join others by
+  entity: `for (vel.dense, vel.owners) |v, e| { position.get(e).?.* += v*dt; }`.
+- What it *doesn't* have (flecs' payoff): relationships, prefabs, query filters,
+  system pipelines, archetype packing. Add if/when needed, or switch to `zflecs`.
 
 =)

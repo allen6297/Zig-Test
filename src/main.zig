@@ -21,7 +21,7 @@ const c = @cImport({
 /// loop, and let `defer` tear everything down in reverse order. The real work
 /// lives in the functions below, each a self-contained (and foldable) unit.
 pub fn main(init: std.process.Init) !void {
-    _ = init;
+    const io = init.io; // for world save/load file I/O
 
     // Bring up SDL's video subsystem. SDL3 returns `true` on success (SDL2
     // returned 0 — the API flipped), so a falsy result means failure.
@@ -70,6 +70,9 @@ pub fn main(init: std.process.Init) !void {
 
     var world = zig_test.world.World.init(alloc, genChunk);
     defer world.deinit();
+    // Load saved edits (diff from generated terrain); no-op on first run.
+    loadWorld(io, alloc, &world) catch |err| std.log.warn("world load failed: {}", .{err});
+    defer saveWorld(io, alloc, &world) catch |err| std.log.warn("world save failed: {}", .{err});
 
     var renderer = try Renderer.init(&vulkan, &swapchain, capacity, 16384, 24576);
     defer renderer.deinit(&vulkan);
@@ -78,7 +81,71 @@ pub fn main(init: std.process.Init) !void {
     defer stream.deinit();
     std.debug.print("world: streaming, radius {d} chunks, capacity {d}\n", .{ radius, capacity });
 
-    try runLoop(window, &vulkan, &swapchain, &renderer, &stream);
+    try runLoop(io, window, &vulkan, &swapchain, &renderer, &stream);
+}
+
+/// Where player edits are persisted (a compact diff from the generated world).
+const save_path = "world.sav";
+
+/// Generate the 3×3×3 chunks around the player so collision has real ground even
+/// before the (budgeted) streamer has loaded them — otherwise the player falls
+/// through the world on spawn or when moving into freshly-entered chunks.
+/// `ensure` is a cheap cache hit once a chunk exists.
+fn ensurePlayerChunks(world: *zig_test.world.World, pos: zig_test.math.Vec3) void {
+    const size = zig_test.chunk.size;
+    const cx = @divFloor(@as(i32, @intFromFloat(@floor(pos.x))), size);
+    const cy = @divFloor(@as(i32, @intFromFloat(@floor(pos.y))), size);
+    const cz = @divFloor(@as(i32, @intFromFloat(@floor(pos.z))), size);
+    var dx: i32 = -1;
+    while (dx <= 1) : (dx += 1) {
+        var dy: i32 = -1;
+        while (dy <= 1) : (dy += 1) {
+            var dz: i32 = -1;
+            while (dz <= 1) : (dz += 1) {
+                _ = world.ensure(.{ .x = cx + dx, .y = cy + dy, .z = cz + dz }) catch {};
+            }
+        }
+    }
+}
+
+/// Read the save file (if any) and load its edits into the world.
+fn loadWorld(io: std.Io, alloc: std.mem.Allocator, world: *zig_test.world.World) !void {
+    const data = std.Io.Dir.cwd().readFileAlloc(io, save_path, alloc, .unlimited) catch |err| switch (err) {
+        error.FileNotFound => return, // first run
+        else => return err,
+    };
+    defer alloc.free(data);
+    try world.deserialize(data);
+}
+
+/// Serialize the world's edits and write them to the save file.
+fn saveWorld(io: std.Io, alloc: std.mem.Allocator, world: *zig_test.world.World) !void {
+    const data = try world.serialize(alloc);
+    defer alloc.free(data);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = save_path, .data = data });
+}
+
+const player_save_path = "player.sav";
+
+/// Persisted player state: feet position + look angles.
+const PlayerSave = extern struct { x: f32, y: f32, z: f32, yaw: f32, pitch: f32 };
+
+/// Restore player position + look from disk (no-op if there's no save).
+fn loadPlayer(io: std.Io, player: *zig_test.player.Player, cam: *zig_test.camera.Camera) void {
+    var buf: [64]u8 = undefined;
+    const data = std.Io.Dir.cwd().readFile(io, player_save_path, &buf) catch return;
+    if (data.len < @sizeOf(PlayerSave)) return;
+    var s: PlayerSave = undefined;
+    @memcpy(std.mem.asBytes(&s), data[0..@sizeOf(PlayerSave)]);
+    player.pos = .{ .x = s.x, .y = s.y, .z = s.z };
+    cam.yaw = s.yaw;
+    cam.pitch = s.pitch;
+}
+
+/// Write player position + look to disk.
+fn savePlayer(io: std.Io, player: *const zig_test.player.Player, cam: *const zig_test.camera.Camera) !void {
+    const s = PlayerSave{ .x = player.pos.x, .y = player.pos.y, .z = player.pos.z, .yaw = cam.yaw, .pitch = cam.pitch };
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = player_save_path, .data = std.mem.asBytes(&s) });
 }
 
 /// Deterministic terrain generator: fills a chunk from its world coordinate with
@@ -140,11 +207,15 @@ fn initVulkan(allocator: std.mem.Allocator, window: *c.SDL_Window) !VulkanContex
 
 /// Create the application window and return it, or an error on failure.
 fn createWindow() !*c.SDL_Window {
-    // The last arg is a bitmask of flags. `SDL_WINDOW_VULKAN` makes SDL load the
-    // Vulkan library and prepare the window to host a Vulkan surface. This works
-    // now that MoltenVK is present (via the LunarG SDK at ~/VulkanSDK). C strings
-    // are null-terminated, exactly what Zig's `"..."` literals already are.
-    return c.SDL_CreateWindow("zig voxel test", 1280, 720, c.SDL_WINDOW_VULKAN) orelse {
+    // `SDL_WINDOW_VULKAN` prepares the window to host a Vulkan surface;
+    // `MAXIMIZED` (+ `RESIZABLE`, required for maximize) opens it filling the
+    // screen. The 1280×720 is just the restored (un-maximized) size. The
+    // swapchain sizes itself from the surface's actual extent, so the render
+    // targets match whatever the window opens at.
+    // NOTE: live resizing isn't handled yet (no swapchain recreation) — resizing
+    // the window mid-run freezes rendering until it's back to the original size.
+    const flags = c.SDL_WINDOW_VULKAN | c.SDL_WINDOW_MAXIMIZED | c.SDL_WINDOW_RESIZABLE;
+    return c.SDL_CreateWindow("zig voxel test", 1280, 720, flags) orelse {
         std.debug.print("SDL_CreateWindow failed: {s}\n", .{c.SDL_GetError()});
         return error.SdlWindow;
     };
@@ -152,6 +223,7 @@ fn createWindow() !*c.SDL_Window {
 
 /// The main game loop: set up per-frame state, then run until the user quits.
 fn runLoop(
+    io: std.Io,
     window: *c.SDL_Window,
     vulkan: *VulkanContext,
     swapchain: *Swapchain,
@@ -164,16 +236,22 @@ fn runLoop(
     // per-frame math is a plain division.
     const freq: f64 = @floatFromInt(c.SDL_GetPerformanceFrequency());
     var last_tick = c.SDL_GetPerformanceCounter();
-    var elapsed: f32 = 0; // seconds since start, for the clear-colour cycle
 
     // Simple stat: accumulate time and frames to print an FPS line once a second,
     // so we can *see* delta-time working without any rendering yet.
     var fps_accum: f64 = 0;
     var fps_frames: u32 = 0;
 
-    // The camera, above the (streamed, unbounded) terrain. Fly around and chunks
-    // load/unload around you. Faster move speed to cover ground.
-    var cam = zig_test.camera.Camera{ .position = .{ .x = 0, .y = 45, .z = 30 }, .move_speed = 24 };
+    // Camera holds the look direction (yaw/pitch); its position is driven by the
+    // player each frame. A walking player above the terrain — it falls to the
+    // ground and collides with blocks. Physics runs on a fixed timestep.
+    var cam = zig_test.camera.Camera{};
+    var player = zig_test.player.Player{ .pos = .{ .x = 0, .y = 45, .z = 30 } };
+    // Restore saved position + look (no-op on first run); save on exit.
+    loadPlayer(io, &player, &cam);
+    defer savePlayer(io, &player, &cam) catch |err| std.log.warn("player save failed: {}", .{err});
+    var phys_accum: f32 = 0;
+    const phys_step: f32 = 1.0 / 60.0;
 
     // Capture the mouse so motion turns the camera (like any FPS). This hides
     // the cursor and lets us read raw relative motion instead of an absolute
@@ -202,6 +280,16 @@ fn runLoop(
                     // `xrel`/`yrel` are how far the mouse moved since last event.
                     cam.look(event.motion.xrel, event.motion.yrel);
                 },
+                c.SDL_EVENT_MOUSE_BUTTON_DOWN => {
+                    // Aim a ray from the camera; left = break, right = place.
+                    if (zig_test.raycast.raycastVoxel(stream.world, cam.position, cam.forward(), 6.0)) |h| {
+                        if (event.button.button == c.SDL_BUTTON_LEFT) {
+                            try stream.editBlock(vulkan, h.block[0], h.block[1], h.block[2], .air);
+                        } else if (event.button.button == c.SDL_BUTTON_RIGHT) {
+                            try stream.editBlock(vulkan, h.block[0] + h.normal[0], h.block[1] + h.normal[1], h.block[2] + h.normal[2], .stone);
+                        }
+                    }
+                },
                 else => {},
             }
         }
@@ -212,36 +300,39 @@ fn runLoop(
         const keys = c.SDL_GetKeyboardState(null);
         const move = readMovement(keys);
 
-        // 4. Update: drive the camera from input. `move.x` strafes, and forward
-        //    is -move.z (W set z to -1). dt keeps speed frame-rate independent.
-        cam.move(move.x, -move.z, move.y, move.sprint, @floatCast(dt));
+        // 4. Physics: step the player on a fixed timestep (stable collision),
+        //    then place the camera at its eyes. Look stays per-frame (mouse).
+        //    advance = -move.z (W → forward), strafe = move.x, jump = space.
+        //    Collision reads the world grid, but streaming loads chunks lazily —
+        //    so we generate the chunks around the player up front (cheap, cached)
+        //    to guarantee there's ground under them (else they fall on spawn).
+        phys_accum += @floatCast(dt);
+        while (phys_accum >= phys_step) : (phys_accum -= phys_step) {
+            ensurePlayerChunks(stream.world, player.pos);
+            player.step(stream.world, -move.z, move.x, move.y < 0, move.sprint, cam.yaw, phys_step);
+        }
+        cam.position = player.eye();
 
-        // 4b. Stream: load/unload chunks around the camera. Cheap no-op unless
-        //     the camera crossed into a new chunk.
+        // 4b. Stream: load/unload chunks around the player. Cheap no-op unless
+        //     the player crossed into a new chunk.
         try stream.update(vulkan, cam.position);
 
         // 5. Render: build the shared per-frame uniforms and draw the world.
         //    Vertices are chunk-local; each chunk's world origin is a push
         //    constant, so we only need view × projection here (no model matrix).
-        elapsed += @floatCast(dt);
         const math = zig_test.math;
         const aspect: f32 = @as(f32, @floatFromInt(swapchain.extent.width)) /
             @as(f32, @floatFromInt(swapchain.extent.height));
         const proj = math.Mat4.perspectiveVulkan(std.math.degreesToRadians(60.0), aspect, 0.1, 500.0);
         const viewproj = proj.mul(cam.view());
 
-        // A single dynamic point light orbiting above the camera, so the terrain
-        // under you is always lit and the lighting is visibly *moving*.
-        const light = zig_test.math.Vec3{
-            .x = cam.position.x + 30.0 * @sin(elapsed * 0.5),
-            .y = 45.0,
-            .z = cam.position.z + 30.0 * @cos(elapsed * 0.5),
-        };
+        // Lighting is flat for now (AO + fixed face shade in the shader), so the
+        // light_* uniform fields are unused. Real lighting returns with deferred.
         const planes = math.frustumPlanes(viewproj);
         try renderer.drawFrame(vulkan, swapchain, .{
             .viewproj = viewproj.m,
-            .light_pos = .{ light.x, light.y, light.z, 1.0 },
-            .light_color = .{ 1.0, 0.85, 0.6, 600.0 }, // warm light, intensity in w
+            .light_pos = .{ 0, 0, 0, 0 },
+            .light_color = .{ 0, 0, 0, 0 },
         }, planes);
 
         // Once-a-second readout: FPS plus the camera's position and look angles,

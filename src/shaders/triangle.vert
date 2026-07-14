@@ -24,6 +24,7 @@ layout(location = 0) in uint packed;
 layout(location = 0) out vec3 world_pos;
 layout(location = 1) out vec3 normal;
 layout(location = 2) out vec3 albedo;
+layout(location = 3) out float ao;
 
 // Base colour per block id (index matches BlockId in src/block.zig).
 const vec3 block_colors[6] = vec3[](
@@ -49,6 +50,9 @@ void main() {
     float z = float((packed >> 12) & 63u);
     uint face = (packed >> 18) & 7u;
     uint block = (packed >> 21) & 255u;
+    uint ao_bits = (packed >> 29) & 3u;
+    // Map 0..3 → a brightness multiplier (darkest corners keep some ambient).
+    ao = mix(0.35, 1.0, float(ao_bits) / 3.0);
 
     // Chunk-local position → world position by adding this chunk's origin,
     // looked up by the per-chunk instance index.

@@ -38,15 +38,20 @@ pub const Mesh = struct {
 const pos_faces = [3]Face{ .pos_x, .pos_y, .pos_z };
 const neg_faces = [3]Face{ .neg_x, .neg_y, .neg_z };
 
-/// One cell of the per-plane mask: which face (if any) sits here.
+/// One cell of the per-plane mask: which face (if any) sits here, plus the
+/// ambient-occlusion value (0..3) at each of its 4 corners.
 const MaskCell = struct {
     present: bool = false,
     face: Face = .pos_x,
     block: u32 = 0,
+    ao: [4]u8 = .{ 0, 0, 0, 0 },
 };
 
 fn merges(a: MaskCell, b: MaskCell) bool {
-    return a.present and b.present and a.face == b.face and a.block == b.block;
+    // Faces only merge when the block, direction, AND corner-AO all match —
+    // otherwise AO would be smeared across a big quad (the greedy/AO trade-off).
+    return a.present and b.present and a.face == b.face and a.block == b.block and
+        std.mem.eql(u8, &a.ao, &b.ao);
 }
 
 /// Mesh the chunk at grid coordinate (`cx`,`cy`,`cz`) of `world` into freshly-
@@ -90,11 +95,12 @@ pub fn build(allocator: std.mem.Allocator, world: *const World, cx: i32, cy: i32
                     const a = world.blockAt(wa[0], wa[1], wa[2]);
                     const b = world.blockAt(wb[0], wb[1], wb[2]);
                     // A face exists only where solid meets air; it belongs to the
-                    // solid block and faces toward the air side.
+                    // solid block and faces toward the air side. AO is sampled from
+                    // the occluders in that air-side layer (wb for +d, wa for −d).
                     mask[i + j * size] = if (a.isSolid() and !b.isSolid())
-                        .{ .present = true, .face = pos_faces[d], .block = @intFromEnum(a) }
+                        .{ .present = true, .face = pos_faces[d], .block = @intFromEnum(a), .ao = cornerAO(world, wb, u, v) }
                     else if (b.isSolid() and !a.isSolid())
-                        .{ .present = true, .face = neg_faces[d], .block = @intFromEnum(b) }
+                        .{ .present = true, .face = neg_faces[d], .block = @intFromEnum(b), .ao = cornerAO(world, wa, u, v) }
                     else
                         .{};
                 }
@@ -173,11 +179,17 @@ fn emitQuad(
     };
 
     const start: u32 = @intCast(verts.items.len);
-    for (corners) |p| {
-        try verts.append(allocator, mesh.pack(p[0], p[1], p[2], cell.face, cell.block));
+    for (corners, 0..) |p, k| {
+        try verts.append(allocator, mesh.pack(p[0], p[1], p[2], cell.face, cell.block, cell.ao[k]));
     }
-    // Two triangles: 0-1-2 and 0-2-3.
-    try indices.appendSlice(allocator, &.{ start, start + 1, start + 2, start, start + 2, start + 3 });
+    // Two triangles. Flip the split diagonal when the AO gradient runs the other
+    // way, so the interpolation doesn't produce an anisotropic "seam" across the
+    // quad (the standard voxel-AO fix).
+    if (cell.ao[0] + cell.ao[2] > cell.ao[1] + cell.ao[3]) {
+        try indices.appendSlice(allocator, &.{ start + 1, start + 2, start + 3, start + 1, start + 3, start });
+    } else {
+        try indices.appendSlice(allocator, &.{ start, start + 1, start + 2, start, start + 2, start + 3 });
+    }
 }
 
 fn corner(base: [3]u32, u: usize, v: usize, du: u32, dv: u32) [3]u32 {
@@ -185,6 +197,36 @@ fn corner(base: [3]u32, u: usize, v: usize, du: u32, dv: u32) [3]u32 {
     p[u] += du;
     p[v] += dv;
     return p;
+}
+
+/// Ambient occlusion for a face's 4 corners. `air` is the empty block the face
+/// looks into; `u_axis`/`v_axis` are the two in-plane axes. Each corner is darker
+/// the more of its 3 neighbouring voxels (two edge, one diagonal, in the air-side
+/// layer) are solid. Returns 0 (darkest) .. 3 (fully open). Corner order matches
+/// the quad corners: (0,0), (+u,0), (+u,+v), (0,+v).
+fn cornerAO(world: *const World, air: [3]i32, u_axis: usize, v_axis: usize) [4]u8 {
+    // (du, dv) for each of the 4 corners.
+    const dirs = [4][2]i32{ .{ -1, -1 }, .{ 1, -1 }, .{ 1, 1 }, .{ -1, 1 } };
+    var out: [4]u8 = undefined;
+    for (dirs, 0..) |dir, k| {
+        var p_u = air;
+        p_u[u_axis] += dir[0];
+        var p_v = air;
+        p_v[v_axis] += dir[1];
+        var p_c = air;
+        p_c[u_axis] += dir[0];
+        p_c[v_axis] += dir[1];
+        const side1: u8 = @intFromBool(solidAt(world, p_u));
+        const side2: u8 = @intFromBool(solidAt(world, p_v));
+        const cornerv: u8 = @intFromBool(solidAt(world, p_c));
+        // Two solid sides fully enclose the corner → darkest.
+        out[k] = if (side1 == 1 and side2 == 1) 0 else 3 - (side1 + side2 + cornerv);
+    }
+    return out;
+}
+
+fn solidAt(world: *const World, c: [3]i32) bool {
+    return world.blockAt(c[0], c[1], c[2]).isSolid();
 }
 
 // --- tests -----------------------------------------------------------------
@@ -237,6 +279,22 @@ test "a full 16x16 slab merges to 6 quads" {
     // versus 576 faces unmerged. This is the whole point of greedy meshing.
     try testing.expectEqual(@as(usize, 6 * 4), m.vertices.len);
     try testing.expectEqual(@as(usize, 6 * 6), m.indices.len);
+}
+
+test "ambient occlusion darkens corners near occluders" {
+    var world = World.init(testing.allocator, null);
+    defer world.deinit();
+    try world.setBlock(8, 8, 8, .stone);
+
+    // Top face's air block is (8,9,8); with nothing around, every corner is open.
+    const open = cornerAO(&world, .{ 8, 9, 8 }, 0, 2); // tangents x(0), z(2)
+    try testing.expectEqual([4]u8{ 3, 3, 3, 3 }, open);
+
+    // Add a block in the +x air-side layer → the +x corners (indices 1,2) darken.
+    try world.setBlock(9, 9, 8, .stone);
+    const occluded = cornerAO(&world, .{ 8, 9, 8 }, 0, 2);
+    try testing.expect(occluded[1] < 3 and occluded[2] < 3);
+    try testing.expectEqual(@as(u8, 3), occluded[0]); // −x corner still open
 }
 
 test "faces are culled against neighbouring chunks" {
