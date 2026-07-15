@@ -156,6 +156,30 @@ pub fn main(init: std.process.Init) !void {
     try runLoop(io, window, &vulkan, &swapchain, &renderer, &stream, &server, &conn, nc_ptr);
 }
 
+/// A remote player the client renders as an avatar. Fixed-size table (server caps
+/// clients), keyed by the server-assigned entity id.
+const max_entities = 32;
+const RemoteEntity = struct { id: u32, state: zig_test.protocol.PlayerState, active: bool };
+
+/// Create/update a remote entity's state.
+fn upsertEntity(entities: []RemoteEntity, id: u32, state: zig_test.protocol.PlayerState) void {
+    for (entities) |*e| if (e.active and e.id == id) {
+        e.state = state;
+        return;
+    };
+    for (entities) |*e| if (!e.active) {
+        e.* = .{ .id = id, .state = state, .active = true };
+        return;
+    };
+}
+
+fn removeEntity(entities: []RemoteEntity, id: u32) void {
+    for (entities) |*e| if (e.active and e.id == id) {
+        e.active = false;
+        return;
+    };
+}
+
 /// Client join sync: pump the connection until the server's world snapshot
 /// arrives (the edit-diff), and apply it to the local world. Times out after a
 /// few seconds and continues with locally-generated terrain if none comes.
@@ -396,6 +420,12 @@ fn runLoop(
     var last_shadow_chunks: usize = 0;
     var shadow_timer: u32 = 0;
 
+    // Multiplayer entity state (client mode): our own server-assigned id (0 until
+    // assigned), the other players we render, and a throttle for position reports.
+    var own_id: u32 = 0;
+    var entities = [_]RemoteEntity{.{ .id = 0, .state = undefined, .active = false }} ** max_entities;
+    var pos_send_accum: f32 = 0;
+
     // Capture the mouse so motion turns the camera (like any FPS). This hides
     // the cursor and lets us read raw relative motion instead of an absolute
     // position pinned to the window edge.
@@ -480,6 +510,9 @@ fn runLoop(
                             stream.applyBlockChange(vulkan, b.x, b.y, b.z) catch {};
                             renderer.editShadowVoxel(stream.world, b.x, b.y, b.z);
                         },
+                        .assign_id => |id| own_id = id,
+                        .entity_moved => |e| if (e.id != own_id) upsertEntity(&entities, e.id, e.state),
+                        .entity_despawn => |id| removeEntity(&entities, id),
                         .snapshot => {}, // initial sync happens before the loop
                     };
                 }
@@ -533,6 +566,16 @@ fn runLoop(
             }
         }
         cam.position = player.eye();
+
+        // 4a2. Multiplayer: report our position to the server a few dozen times a
+        //      second so it can relay it to the other players' clients.
+        if (net_client) |nc| {
+            pos_send_accum += @floatCast(dt);
+            if (pos_send_accum >= 0.033) {
+                pos_send_accum = 0;
+                nc.sendPlayerState(.{ .x = player.pos.x, .y = player.pos.y, .z = player.pos.z, .yaw = cam.yaw });
+            }
+        }
 
         // 4b. Stream: load/unload chunks around the player. Cheap no-op unless
         //     the player crossed into a new chunk.

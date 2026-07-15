@@ -50,6 +50,13 @@ pub const NetClient = struct {
         const bytes = protocol.encodeAction(action, &buf);
         _ = c.nz_send(self.peer, bytes.ptr, bytes.len);
     }
+
+    /// Report this client's position to the server (relayed to other clients).
+    pub fn sendPlayerState(self: *NetClient, state: protocol.PlayerState) void {
+        var buf: [protocol.player_state_len]u8 = undefined;
+        const bytes = protocol.encodePlayerState(state, &buf);
+        _ = c.nz_send(self.peer, bytes.ptr, bytes.len);
+    }
 };
 
 /// End-to-end smoke test with no window and no second process: stand up a server
@@ -115,31 +122,42 @@ pub fn clientTest(port: u16) !void {
     defer nc.deinit();
 
     const edit = protocol.BlockChange{ .x = 3, .y = 4, .z = 5, .block = .stone };
+    const pos = protocol.PlayerState{ .x = 1, .y = 2, .z = 3, .yaw = 0.5 };
     var got_snapshot = false;
+    var got_id = false;
     var sent = false;
     var got_echo = false;
+    var got_entity = false; // our position relayed back to us as an entity_moved
 
     var iter: u32 = 0;
-    while (iter < 300 and !got_echo) : (iter += 1) {
+    while (iter < 300 and !(got_echo and got_entity)) : (iter += 1) {
         var ev: c.NzEvent = undefined;
         while (c.nz_service(nc.host, &ev, 10) > 0) {
             if (ev.kind == c.NZ_RECEIVE and ev.len > 0) {
                 if (protocol.decodeServerMessage(ev.data[0..ev.len])) |msg| switch (msg) {
                     .snapshot => got_snapshot = true,
+                    .assign_id => got_id = true,
                     .block_changed => |b| {
                         if (b.x == edit.x and b.y == edit.y and b.z == edit.z and b.block == edit.block) got_echo = true;
                     },
+                    .entity_moved => |e| {
+                        if (std.meta.eql(e.state, pos)) got_entity = true;
+                    },
+                    .entity_despawn => {},
                 };
             }
             c.nz_free_packet(&ev);
         }
         if (got_snapshot and !sent) {
             nc.sendAction(.{ .set_block = edit });
+            nc.sendPlayerState(pos);
             sent = true;
         }
     }
 
     if (!got_snapshot) return error.NoSnapshot;
+    if (!got_id) return error.NoId;
     if (!got_echo) return error.NoEcho;
-    std.debug.print("clienttest: OK — connected, synced snapshot, set_block echoed back\n", .{});
+    if (!got_entity) return error.NoEntityRelay;
+    std.debug.print("clienttest: OK — id + snapshot, block echo, and position relayed back as an entity\n", .{});
 }
