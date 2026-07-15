@@ -58,6 +58,7 @@ const max_frames_in_flight = 2;
 const depth_format: vk.Format = .d32_sfloat;
 const albedo_format: vk.Format = .r8g8b8a8_unorm;
 const normal_format: vk.Format = .r16g16b16a16_sfloat;
+const motion_format: vk.Format = .r16g16_sfloat; // screen-space motion vectors for TAA
 const hdr_format: vk.Format = .r16g16b16a16_sfloat;
 
 const Frame = struct {
@@ -175,6 +176,7 @@ pub const Renderer = struct {
     // Per-frame render targets (double-buffered so frames don't stomp each other).
     gbuf_albedo: [max_frames_in_flight]Attachment,
     gbuf_normal: [max_frames_in_flight]Attachment,
+    gbuf_motion: [max_frames_in_flight]Attachment,
     depth: [max_frames_in_flight]Attachment,
     lit: [max_frames_in_flight]Attachment,
     resolved: [max_frames_in_flight]Attachment, // TAA output + next-frame history
@@ -206,27 +208,32 @@ pub const Renderer = struct {
         errdefer vkd.destroyDescriptorSetLayout(dev, geo_set_layout, null);
 
         // Post set (shared by lighting + TAA): binding 0 uniforms, bindings 1..3
-        // sampled 2D inputs, binding 4 the 3D shadow volume (used by lighting; the
-        // TAA pass declares it too so both can share one layout).
+        // sampled 2D inputs, binding 4 the 3D shadow volume (lighting), binding 5
+        // the motion target (TAA). Both passes declare all bindings so they share
+        // one layout; each ignores the ones it doesn't sample.
         const post_set_layout = try vkd.createDescriptorSetLayout(dev, &.{
-            .binding_count = 5,
+            .binding_count = 6,
             .p_bindings = &.{
                 .{ .binding = 0, .descriptor_type = .uniform_buffer, .descriptor_count = 1, .stage_flags = .{ .fragment_bit = true } },
                 .{ .binding = 1, .descriptor_type = .combined_image_sampler, .descriptor_count = 1, .stage_flags = .{ .fragment_bit = true } },
                 .{ .binding = 2, .descriptor_type = .combined_image_sampler, .descriptor_count = 1, .stage_flags = .{ .fragment_bit = true } },
                 .{ .binding = 3, .descriptor_type = .combined_image_sampler, .descriptor_count = 1, .stage_flags = .{ .fragment_bit = true } },
                 .{ .binding = 4, .descriptor_type = .combined_image_sampler, .descriptor_count = 1, .stage_flags = .{ .fragment_bit = true } },
+                .{ .binding = 5, .descriptor_type = .combined_image_sampler, .descriptor_count = 1, .stage_flags = .{ .fragment_bit = true } },
             },
         }, null);
         errdefer vkd.destroyDescriptorSetLayout(dev, post_set_layout, null);
 
-        var geometry_pipeline = try pipeline_mod.initGeometry(ctx, &.{ albedo_format, normal_format }, depth_format, geo_set_layout);
+        // The geometry + entity passes write 3 G-buffer colour targets: albedo,
+        // normal, motion.
+        const gbuf_formats = [_]vk.Format{ albedo_format, normal_format, motion_format };
+        var geometry_pipeline = try pipeline_mod.initGeometry(ctx, &gbuf_formats, depth_format, geo_set_layout);
         errdefer geometry_pipeline.deinit(ctx);
         var lighting_pipeline = try pipeline_mod.initFullscreen(ctx, &.{hdr_format}, post_set_layout, "lighting_frag");
         errdefer lighting_pipeline.deinit(ctx);
         var taa_pipeline = try pipeline_mod.initFullscreen(ctx, &.{ swapchain.format, hdr_format }, post_set_layout, "taa_frag");
         errdefer taa_pipeline.deinit(ctx);
-        var entity_pipeline = try pipeline_mod.initEntity(ctx, &.{ albedo_format, normal_format }, depth_format, geo_set_layout);
+        var entity_pipeline = try pipeline_mod.initEntity(ctx, &gbuf_formats, depth_format, geo_set_layout);
         errdefer entity_pipeline.deinit(ctx);
 
         // The shared avatar cube, uploaded once.
@@ -295,12 +302,14 @@ pub const Renderer = struct {
 
         var gbuf_albedo: [max_frames_in_flight]Attachment = undefined;
         var gbuf_normal: [max_frames_in_flight]Attachment = undefined;
+        var gbuf_motion: [max_frames_in_flight]Attachment = undefined;
         var depth: [max_frames_in_flight]Attachment = undefined;
         var lit: [max_frames_in_flight]Attachment = undefined;
         var resolved: [max_frames_in_flight]Attachment = undefined;
         for (0..max_frames_in_flight) |i| {
             gbuf_albedo[i] = try Attachment.init(ctx, extent, albedo_format, color_sampled, .{ .color_bit = true });
             gbuf_normal[i] = try Attachment.init(ctx, extent, normal_format, color_sampled, .{ .color_bit = true });
+            gbuf_motion[i] = try Attachment.init(ctx, extent, motion_format, color_sampled, .{ .color_bit = true });
             depth[i] = try Attachment.init(ctx, extent, depth_format, depth_sampled, .{ .depth_bit = true });
             lit[i] = try Attachment.init(ctx, extent, hdr_format, color_sampled, .{ .color_bit = true });
             resolved[i] = try Attachment.init(ctx, extent, hdr_format, color_sampled, .{ .color_bit = true });
@@ -317,7 +326,7 @@ pub const Renderer = struct {
             .p_pool_sizes = &.{
                 .{ .type = .uniform_buffer, .descriptor_count = 3 * max_frames_in_flight },
                 .{ .type = .storage_buffer, .descriptor_count = max_frames_in_flight },
-                .{ .type = .combined_image_sampler, .descriptor_count = 2 * 4 * max_frames_in_flight },
+                .{ .type = .combined_image_sampler, .descriptor_count = 2 * 5 * max_frames_in_flight },
             },
         }, null);
         errdefer vkd.destroyDescriptorPool(dev, descriptor_pool, null);
@@ -343,8 +352,9 @@ pub const Renderer = struct {
             writeImage(vkd, dev, lighting_sets[i], 2, gbuf_normal[i].view, sampler_nearest);
             writeImage(vkd, dev, lighting_sets[i], 3, depth[i].view, sampler_nearest);
             writeImage(vkd, dev, lighting_sets[i], 4, shadow_volume.view, sampler_nearest);
+            writeImage(vkd, dev, lighting_sets[i], 5, gbuf_motion[i].view, sampler_nearest); // unused by lighting; satisfies shared layout
             // TAA set: uniforms + current lit (nearest) + history = other slot's
-            // resolved (linear, for sub-pixel reprojection) + depth (nearest). The
+            // resolved (linear, for sub-pixel reprojection) + depth + motion. The
             // shadow volume is bound too (binding 4) only to satisfy the shared layout.
             const other = (i + 1) % max_frames_in_flight;
             writeBuffer(vkd, dev, taa_sets[i], 0, .uniform_buffer, ub, @sizeOf(mesh.Uniforms));
@@ -352,6 +362,7 @@ pub const Renderer = struct {
             writeImage(vkd, dev, taa_sets[i], 2, resolved[other].view, sampler_linear);
             writeImage(vkd, dev, taa_sets[i], 3, depth[i].view, sampler_nearest);
             writeImage(vkd, dev, taa_sets[i], 4, shadow_volume.view, sampler_nearest);
+            writeImage(vkd, dev, taa_sets[i], 5, gbuf_motion[i].view, sampler_nearest);
         }
         //endregion
 
@@ -391,6 +402,7 @@ pub const Renderer = struct {
             .sampler_linear = sampler_linear,
             .gbuf_albedo = gbuf_albedo,
             .gbuf_normal = gbuf_normal,
+            .gbuf_motion = gbuf_motion,
             .depth = depth,
             .lit = lit,
             .resolved = resolved,
@@ -407,6 +419,7 @@ pub const Renderer = struct {
         for (0..max_frames_in_flight) |i| {
             self.gbuf_albedo[i].deinit(ctx);
             self.gbuf_normal[i].deinit(ctx);
+            self.gbuf_motion[i].deinit(ctx);
             self.depth[i].deinit(ctx);
             self.lit[i].deinit(ctx);
             self.resolved[i].deinit(ctx);
@@ -608,6 +621,7 @@ pub const Renderer = struct {
         //region geometry pass → G-buffer
         imageBarrier(vkd, cmd, self.gbuf_albedo[f].image, colorWriteBarrier(.undefined));
         imageBarrier(vkd, cmd, self.gbuf_normal[f].image, colorWriteBarrier(.undefined));
+        imageBarrier(vkd, cmd, self.gbuf_motion[f].image, colorWriteBarrier(.undefined));
         imageBarrier(vkd, cmd, self.depth[f].image, .{
             .aspect = .{ .depth_bit = true },
             .old_layout = .undefined,
@@ -621,6 +635,7 @@ pub const Renderer = struct {
         const gbuf_attachments = [_]vk.RenderingAttachmentInfo{
             colorAttachment(self.gbuf_albedo[f].view, .clear, .{ .color = .{ .float_32 = .{ 0, 0, 0, 0 } } }),
             colorAttachment(self.gbuf_normal[f].view, .clear, .{ .color = .{ .float_32 = .{ 0, 0, 0, 0 } } }),
+            colorAttachment(self.gbuf_motion[f].view, .clear, .{ .color = .{ .float_32 = .{ 0, 0, 0, 0 } } }),
         };
         const depth_attachment = vk.RenderingAttachmentInfo{
             .image_view = self.depth[f].view,
@@ -655,6 +670,7 @@ pub const Renderer = struct {
             for (entities) |e| {
                 const push = mesh.EntityPush{
                     .pos = .{ e.pos[0], e.pos[1], e.pos[2], 0 },
+                    .prev_pos = .{ e.prev_pos[0], e.prev_pos[1], e.prev_pos[2], 0 },
                     .color = .{ e.color[0], e.color[1], e.color[2], 1 },
                 };
                 vkd.cmdPushConstants(cmd, self.entity_pipeline.layout, .{ .vertex_bit = true }, 0, @sizeOf(mesh.EntityPush), &push);
@@ -667,6 +683,7 @@ pub const Renderer = struct {
         //region lighting pass → lit
         imageBarrier(vkd, cmd, self.gbuf_albedo[f].image, colorToSampledBarrier());
         imageBarrier(vkd, cmd, self.gbuf_normal[f].image, colorToSampledBarrier());
+        imageBarrier(vkd, cmd, self.gbuf_motion[f].image, colorToSampledBarrier());
         imageBarrier(vkd, cmd, self.depth[f].image, .{
             .aspect = .{ .depth_bit = true },
             .old_layout = .depth_attachment_optimal,

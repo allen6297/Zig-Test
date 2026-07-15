@@ -107,15 +107,18 @@ pub const EntityVertex = extern struct {
     };
 };
 
-/// Per-avatar push constant: feet position + colour.
+/// Per-avatar push constant: current + previous feet position (for motion
+/// vectors) and colour.
 pub const EntityPush = extern struct {
-    pos: [4]f32, // xyz = feet position; w unused
+    pos: [4]f32, // xyz = feet position this frame; w unused
+    prev_pos: [4]f32, // xyz = feet position last frame (for motion vectors); w unused
     color: [4]f32, // rgb = avatar colour; a unused
 };
 
 /// A remote player to draw this frame (built by the client from replicated state).
 pub const EntityInstance = struct {
     pos: [3]f32,
+    prev_pos: [3]f32,
     color: [3]f32,
 };
 

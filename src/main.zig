@@ -160,7 +160,12 @@ pub fn main(init: std.process.Init) !void {
 /// A remote player the client renders as an avatar. Fixed-size table (server caps
 /// clients), keyed by the server-assigned entity id.
 const max_entities = 32;
-const RemoteEntity = struct { id: u32, state: zig_test.protocol.PlayerState, active: bool };
+const RemoteEntity = struct {
+    id: u32,
+    state: zig_test.protocol.PlayerState,
+    prev_pos: [3]f32, // position last rendered frame (for motion vectors)
+    active: bool,
+};
 
 /// Create/update a remote entity's state.
 fn upsertEntity(entities: []RemoteEntity, id: u32, state: zig_test.protocol.PlayerState) void {
@@ -169,7 +174,8 @@ fn upsertEntity(entities: []RemoteEntity, id: u32, state: zig_test.protocol.Play
         return;
     };
     for (entities) |*e| if (!e.active) {
-        e.* = .{ .id = id, .state = state, .active = true };
+        // New avatar: prev_pos = current so it doesn't fling a huge motion vector.
+        e.* = .{ .id = id, .state = state, .prev_pos = .{ state.x, state.y, state.z }, .active = true };
         return;
     };
 }
@@ -433,7 +439,7 @@ fn runLoop(
     // Multiplayer entity state (client mode): our own server-assigned id (0 until
     // assigned), the other players we render, and a throttle for position reports.
     var own_id: u32 = 0;
-    var entities = [_]RemoteEntity{.{ .id = 0, .state = undefined, .active = false }} ** max_entities;
+    var entities = [_]RemoteEntity{.{ .id = 0, .state = undefined, .prev_pos = undefined, .active = false }} ** max_entities;
     var pos_send_accum: f32 = 0;
 
     // Capture the mouse so motion turns the camera (like any FPS). This hides
@@ -640,12 +646,15 @@ fn runLoop(
         // through last frame's view-proj (`prev_viewproj`). A warm point light
         // rides the camera (a headlamp) so lighting is visibly dynamic; the
         // renderer fills in framebuffer size + TAA jitter itself.
-        // Build the remote-player avatars to draw this frame (empty in SP).
+        // Build the remote-player avatars to draw this frame (empty in SP), and
+        // advance each one's prev_pos for next frame's motion vector.
         var entity_instances: [max_entities]mesh.EntityInstance = undefined;
         var entity_n: usize = 0;
-        for (entities) |e| if (e.active) {
-            entity_instances[entity_n] = .{ .pos = .{ e.state.x, e.state.y, e.state.z }, .color = entityColor(e.id) };
+        for (&entities) |*e| if (e.active) {
+            const p = [3]f32{ e.state.x, e.state.y, e.state.z };
+            entity_instances[entity_n] = .{ .pos = p, .prev_pos = e.prev_pos, .color = entityColor(e.id) };
             entity_n += 1;
+            e.prev_pos = p;
         };
 
         const planes = math.frustumPlanes(viewproj);

@@ -2,13 +2,12 @@
 
 // Temporal anti-aliasing resolve. Blends the current frame's lighting with the
 // reprojected history of previous frames, so the per-frame sub-pixel jitter
-// (applied in gbuffer.vert) averages out into smooth edges over time.
+// (applied in the geometry pass) averages out into smooth edges over time.
 //
-// The world is static except for camera motion, so we don't need a motion-vector
-// target: we reconstruct each fragment's world position from depth and reproject
-// it through last frame's view-projection to find where it was on screen. A 3×3
-// neighbourhood colour clamp on the history suppresses ghosting where reprojection
-// is wrong (disocclusions, edits).
+// Reprojection uses the **motion-vector** G-buffer target: each pixel stores where
+// its surface was on screen last frame, so both camera motion *and* moving players
+// reproject correctly (no avatar ghosting). A 3×3 neighbourhood colour clamp on
+// the history suppresses ghosting where reprojection is wrong (disocclusions).
 //
 // Writes two targets: location 0 → the sRGB swapchain (tonemapped; the sRGB
 // format applies gamma on write), location 1 → the history image fed back next
@@ -31,17 +30,12 @@ layout(binding = 0) uniform Uniforms {
 layout(binding = 1) uniform sampler2D lit;     // current frame lighting (linear HDR)
 layout(binding = 2) uniform sampler2D history; // previous resolved frame (linear HDR)
 layout(binding = 3) uniform sampler2D g_depth;
+layout(binding = 5) uniform sampler2D g_motion; // screen-space motion (prev_uv - curr_uv)
 
 layout(location = 0) out vec4 out_swapchain; // tonemapped (sRGB target)
 layout(location = 1) out vec4 out_history;   // linear, fed back next frame
 
 const float history_weight = 0.9; // how much of the accumulated history to keep
-
-vec3 reconstruct(vec2 uv, float depth) {
-    vec4 clip = vec4(uv * 2.0 - 1.0, depth, 1.0);
-    vec4 world = u.inv_viewproj * clip;
-    return world.xyz / world.w;
-}
 
 // ACES filmic tonemap (Narkowicz fit). Maps linear HDR → displayable [0,1].
 vec3 tonemap(vec3 x) {
@@ -71,14 +65,11 @@ void main() {
     vec3 result = current;
     float depth = texture(g_depth, uv).r;
     if (u.taa.x > 0.5 && depth < 1.0) {
-        vec3 P = reconstruct(uv, depth);
-        vec4 pc = u.prev_viewproj * vec4(P, 1.0);
-        if (pc.w > 0.0) {
-            vec2 prev_uv = (pc.xy / pc.w) * 0.5 + 0.5;
-            if (all(greaterThanEqual(prev_uv, vec2(0.0))) && all(lessThanEqual(prev_uv, vec2(1.0)))) {
-                vec3 hist = clamp(texture(history, prev_uv).rgb, mn, mx);
-                result = mix(current, hist, history_weight);
-            }
+        // Where this surface was last frame = current uv + its motion vector.
+        vec2 prev_uv = uv + texture(g_motion, uv).rg;
+        if (all(greaterThanEqual(prev_uv, vec2(0.0))) && all(lessThanEqual(prev_uv, vec2(1.0)))) {
+            vec3 hist = clamp(texture(history, prev_uv).rgb, mn, mx);
+            result = mix(current, hist, history_weight);
         }
     }
 

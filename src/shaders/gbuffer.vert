@@ -35,6 +35,7 @@ layout(location = 0) in uint packed;
 layout(location = 0) out vec3 v_normal;
 layout(location = 1) out vec3 v_albedo;
 layout(location = 2) out float v_ao;
+layout(location = 3) out vec2 v_motion; // screen-space motion (prev_uv - curr_uv)
 
 // Base colour per block id (index matches BlockId in src/block.zig).
 const vec3 block_colors[6] = vec3[](
@@ -66,7 +67,15 @@ void main() {
     vec3 origin = origins[gl_InstanceIndex].xyz;
     vec3 world_pos = origin + vec3(x, y, z);
 
+    // Current + previous clip (unjittered) for the motion vector. Terrain is
+    // static, so the "previous" position is the same world point through last
+    // frame's view-projection — i.e. the motion is purely camera-induced.
     vec4 clip = u.viewproj * vec4(world_pos, 1.0);
+    vec4 prev_clip = u.prev_viewproj * vec4(world_pos, 1.0);
+    vec2 curr_uv = (clip.xy / clip.w) * 0.5 + 0.5;
+    vec2 prev_uv = (prev_clip.xy / prev_clip.w) * 0.5 + 0.5;
+    v_motion = prev_uv - curr_uv;
+
     clip.xy += u.params.zw * clip.w; // sub-pixel TAA jitter (clip space)
     gl_Position = clip;
 
