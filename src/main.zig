@@ -7,6 +7,7 @@ const Renderer = @import("render/renderer.zig").Renderer;
 const chunkMesh = @import("render/chunk_mesh.zig");
 const Stream = @import("render/stream.zig").Stream;
 const ui = @import("ui.zig");
+const net = @import("net.zig");
 
 //region SDL (C interop)
 // Pull SDL's C header straight into Zig. `@cImport` runs the C preprocessor and
@@ -23,6 +24,17 @@ const c = @cImport({
 /// lives in the functions below, each a self-contained (and foldable) unit.
 pub fn main(init: std.process.Init) !void {
     const io = init.io; // for world save/load file I/O
+
+    // `--nettest`: headless ENet loopback smoke test (no window). Verifies the
+    // transport end-to-end without a second process; exits when done.
+    {
+        var it = std.process.Args.Iterator.init(init.minimal.args);
+        defer it.deinit();
+        _ = it.skip(); // program name
+        while (it.next()) |arg| {
+            if (std.mem.eql(u8, arg, "--nettest")) return net.selfTest();
+        }
+    }
 
     // Bring up SDL's video subsystem. SDL3 returns `true` on success (SDL2
     // returned 0 — the API flipped), so a falsy result means failure.

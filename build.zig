@@ -133,6 +133,18 @@ pub fn build(b: *std.Build) void {
     exe.root_module.linkLibrary(zgui.artifact("imgui"));
     //endregion
 
+    //region ENet (reliable UDP — the multiplayer transport)
+    // Vendored single-header ENet (zpl-c/enet, MIT). One C TU compiles the
+    // implementation; source `@cImport`s the header for declarations. Pure BSD
+    // sockets on macOS/Linux, so no extra system libs to link here.
+    // A thin C shim (net_shim.c) implements a minimal API over ENet and compiles
+    // ENet itself. Source `@cImport`s net_shim.h — not enet.h — so translate-c
+    // never has to digest macOS system socket/mach headers. `-w` silences ENet's
+    // own C warnings.
+    exe.root_module.addIncludePath(b.path("vendor/enet"));
+    exe.root_module.addCSourceFile(.{ .file = b.path("vendor/enet/net_shim.c"), .flags = &.{"-w"} });
+    //endregion
+
     //region shaders (GLSL -> SPIR-V)
     // Vulkan consumes SPIR-V, not GLSL, so each shader is compiled at build time
     // with `glslc` and embedded into the binary. In source, `@embedFile(name)`
