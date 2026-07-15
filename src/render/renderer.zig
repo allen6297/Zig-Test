@@ -140,6 +140,8 @@ pub const Renderer = struct {
     geometry_pipeline: Pipeline,
     lighting_pipeline: Pipeline,
     taa_pipeline: Pipeline,
+    entity_pipeline: Pipeline, // player avatars, into the G-buffer
+    entity_vertex_buffer: Buffer, // shared unit-cube mesh
 
     // Geometry: all chunk meshes share one pooled vertex/index buffer; `chunks`
     // is the live set. Changes bump `active_gen`; each frame lazily rebuilds its
@@ -224,6 +226,13 @@ pub const Renderer = struct {
         errdefer lighting_pipeline.deinit(ctx);
         var taa_pipeline = try pipeline_mod.initFullscreen(ctx, &.{ swapchain.format, hdr_format }, post_set_layout, "taa_frag");
         errdefer taa_pipeline.deinit(ctx);
+        var entity_pipeline = try pipeline_mod.initEntity(ctx, &.{ albedo_format, normal_format }, depth_format, geo_set_layout);
+        errdefer entity_pipeline.deinit(ctx);
+
+        // The shared avatar cube, uploaded once.
+        var entity_vertex_buffer = try Buffer.init(ctx, @sizeOf(@TypeOf(mesh.cube_vertices)), .{ .vertex_buffer_bit = true });
+        errdefer entity_vertex_buffer.deinit(ctx);
+        entity_vertex_buffer.write(std.mem.asBytes(&mesh.cube_vertices));
         //endregion
 
         //region command pool, buffers, sync
@@ -359,6 +368,8 @@ pub const Renderer = struct {
             .geometry_pipeline = geometry_pipeline,
             .lighting_pipeline = lighting_pipeline,
             .taa_pipeline = taa_pipeline,
+            .entity_pipeline = entity_pipeline,
+            .entity_vertex_buffer = entity_vertex_buffer,
             .pool = pool,
             .chunks = chunks,
             .capacity = capacity,
@@ -417,6 +428,8 @@ pub const Renderer = struct {
         self.geometry_pipeline.deinit(ctx);
         self.lighting_pipeline.deinit(ctx);
         self.taa_pipeline.deinit(ctx);
+        self.entity_pipeline.deinit(ctx);
+        self.entity_vertex_buffer.deinit(ctx);
         for (self.render_finished) |s| vkd.destroySemaphore(dev, s, null);
         self.allocator.free(self.render_finished);
         for (self.frames) |f| {
@@ -512,7 +525,7 @@ pub const Renderer = struct {
     /// light from the caller; this fills in the framebuffer size, TAA jitter, and
     /// history-valid flag itself. `planes` drives the GPU frustum cull. `ui_render`,
     /// if given, records an overlay (ImGui) into a final pass over the swapchain.
-    pub fn drawFrame(self: *Renderer, ctx: *const Context, swapchain: *const Swapchain, uniforms: mesh.Uniforms, planes: [6][4]f32, ui_render: ?*const fn (vk.CommandBuffer) void) !void {
+    pub fn drawFrame(self: *Renderer, ctx: *const Context, swapchain: *const Swapchain, uniforms: mesh.Uniforms, planes: [6][4]f32, entities: []const mesh.EntityInstance, ui_render: ?*const fn (vk.CommandBuffer) void) !void {
         const vkd = ctx.vkd;
         const dev = ctx.device;
         const frame = self.frames[self.current_frame];
@@ -551,7 +564,7 @@ pub const Renderer = struct {
 
         try vkd.resetFences(dev, &.{frame.in_flight});
         try vkd.resetCommandBuffer(frame.cmd, .{});
-        try self.recordFrame(ctx, frame.cmd, swapchain, image_index, planes, ui_render);
+        try self.recordFrame(ctx, frame.cmd, swapchain, image_index, planes, entities, ui_render);
 
         const wait_stage = vk.PipelineStageFlags{ .color_attachment_output_bit = true };
         try vkd.queueSubmit(ctx.graphics_queue, &.{.{
@@ -580,7 +593,7 @@ pub const Renderer = struct {
     }
 
     /// Record one frame: cull → geometry (G-buffer) → lighting → TAA → UI → present.
-    fn recordFrame(self: *Renderer, ctx: *const Context, cmd: vk.CommandBuffer, swapchain: *const Swapchain, image_index: u32, planes: [6][4]f32, ui_render: ?*const fn (vk.CommandBuffer) void) !void {
+    fn recordFrame(self: *Renderer, ctx: *const Context, cmd: vk.CommandBuffer, swapchain: *const Swapchain, image_index: u32, planes: [6][4]f32, entities: []const mesh.EntityInstance, ui_render: ?*const fn (vk.CommandBuffer) void) !void {
         const vkd = ctx.vkd;
         const f = self.current_frame;
         try vkd.beginCommandBuffer(cmd, &.{});
@@ -632,6 +645,22 @@ pub const Renderer = struct {
         vkd.cmdBindVertexBuffers(cmd, 0, &.{self.pool.vertex_buffer.handle}, &.{0});
         vkd.cmdBindIndexBuffer(cmd, self.pool.index_buffer.handle, 0, .uint32);
         vkd.cmdDrawIndexedIndirect(cmd, self.culler.indirectBuffer(f), 0, self.culler.drawCount(f), @sizeOf(vk.DrawIndexedIndirectCommand));
+
+        // Player avatars: draw the shared cube once per remote entity into the same
+        // G-buffer (so they're lit + shadowed), positioned/coloured via push const.
+        if (entities.len > 0) {
+            vkd.cmdBindPipeline(cmd, .graphics, self.entity_pipeline.handle);
+            vkd.cmdBindDescriptorSets(cmd, .graphics, self.entity_pipeline.layout, 0, &.{self.geo_sets[f]}, null);
+            vkd.cmdBindVertexBuffers(cmd, 0, &.{self.entity_vertex_buffer.handle}, &.{0});
+            for (entities) |e| {
+                const push = mesh.EntityPush{
+                    .pos = .{ e.pos[0], e.pos[1], e.pos[2], 0 },
+                    .color = .{ e.color[0], e.color[1], e.color[2], 1 },
+                };
+                vkd.cmdPushConstants(cmd, self.entity_pipeline.layout, .{ .vertex_bit = true }, 0, @sizeOf(mesh.EntityPush), &push);
+                vkd.cmdDraw(cmd, 36, 1, 0, 0);
+            }
+        }
         endRendering(vkd, cmd);
         //endregion
 

@@ -152,6 +152,7 @@ pub fn build(b: *std.Build) void {
     // pulls in the compiled bytes (see src/render/pipeline.zig).
     addShader(b, exe, "src/shaders/gbuffer.vert", "gbuffer_vert");
     addShader(b, exe, "src/shaders/gbuffer.frag", "gbuffer_frag");
+    addShader(b, exe, "src/shaders/entity.vert", "entity_vert");
     addShader(b, exe, "src/shaders/fullscreen.vert", "fullscreen_vert");
     addShader(b, exe, "src/shaders/lighting.frag", "lighting_frag");
     addShader(b, exe, "src/shaders/taa.frag", "taa_frag");

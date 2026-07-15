@@ -5,6 +5,7 @@ const VulkanContext = @import("render/vulkan.zig").Context;
 const Swapchain = @import("render/swapchain.zig").Swapchain;
 const Renderer = @import("render/renderer.zig").Renderer;
 const chunkMesh = @import("render/chunk_mesh.zig");
+const mesh = @import("render/mesh.zig");
 const Stream = @import("render/stream.zig").Stream;
 const ui = @import("ui.zig");
 const net = @import("net.zig");
@@ -178,6 +179,15 @@ fn removeEntity(entities: []RemoteEntity, id: u32) void {
         e.active = false;
         return;
     };
+}
+
+/// A distinct avatar colour per player, cycled from a small palette by entity id.
+fn entityColor(id: u32) [3]f32 {
+    const palette = [_][3]f32{
+        .{ 0.90, 0.30, 0.30 }, .{ 0.30, 0.85, 0.40 }, .{ 0.40, 0.55, 0.95 },
+        .{ 0.95, 0.80, 0.30 }, .{ 0.80, 0.40, 0.90 }, .{ 0.30, 0.85, 0.90 },
+    };
+    return palette[id % palette.len];
 }
 
 /// Client join sync: pump the connection until the server's world snapshot
@@ -630,6 +640,14 @@ fn runLoop(
         // through last frame's view-proj (`prev_viewproj`). A warm point light
         // rides the camera (a headlamp) so lighting is visibly dynamic; the
         // renderer fills in framebuffer size + TAA jitter itself.
+        // Build the remote-player avatars to draw this frame (empty in SP).
+        var entity_instances: [max_entities]mesh.EntityInstance = undefined;
+        var entity_n: usize = 0;
+        for (entities) |e| if (e.active) {
+            entity_instances[entity_n] = .{ .pos = .{ e.state.x, e.state.y, e.state.z }, .color = entityColor(e.id) };
+            entity_n += 1;
+        };
+
         const planes = math.frustumPlanes(viewproj);
         try renderer.drawFrame(vulkan, swapchain, .{
             .viewproj = viewproj.m,
@@ -644,7 +662,7 @@ fn runLoop(
             .shadow_origin = .{ 0, 0, 0, 0 },
             .shadow_dim = .{ 0, 0, 0, 0 },
             .sun_dir = .{ sun_dir[0], sun_dir[1], sun_dir[2], 0 },
-        }, planes, ui.record);
+        }, planes, entity_instances[0..entity_n], ui.record);
         prev_viewproj = viewproj;
 
         // Windowed FPS: average frames over a short interval (steady, unlike a

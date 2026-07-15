@@ -66,6 +66,41 @@ pub fn initGeometry(
     });
 }
 
+/// The avatar pipeline: draws the shared cube mesh (mesh.EntityVertex) into the
+/// G-buffer, positioned/coloured per entity via an `EntityPush` push constant.
+/// Same attachments + depth test as the geometry pass, so avatars are lit and
+/// shadowed like the world (reusing gbuffer.frag).
+pub fn initEntity(
+    ctx: *const Context,
+    color_formats: []const vk.Format,
+    depth_format: vk.Format,
+    set_layout: vk.DescriptorSetLayout,
+) !Pipeline {
+    const vkd = ctx.vkd;
+    const dev = ctx.device;
+    const vert = try createShaderModule(vkd, dev, "entity_vert");
+    defer vkd.destroyShaderModule(dev, vert, null);
+    const frag = try createShaderModule(vkd, dev, "gbuffer_frag");
+    defer vkd.destroyShaderModule(dev, frag, null);
+
+    const vertex_input = vk.PipelineVertexInputStateCreateInfo{
+        .vertex_binding_description_count = 1,
+        .p_vertex_binding_descriptions = &.{mesh.EntityVertex.binding},
+        .vertex_attribute_description_count = mesh.EntityVertex.attributes.len,
+        .p_vertex_attribute_descriptions = &mesh.EntityVertex.attributes,
+    };
+    return build(ctx, .{
+        .vert = vert,
+        .frag = frag,
+        .set_layout = set_layout,
+        .vertex_input = &vertex_input,
+        .color_formats = color_formats,
+        .depth_format = depth_format,
+        .depth_test = true,
+        .push_constant_size = @sizeOf(mesh.EntityPush),
+    });
+}
+
 /// A fullscreen post pass: no vertex input (the vertex shader builds the
 /// triangle from `gl_VertexIndex`), no depth. `color_formats` lists the colour
 /// attachments this pass writes (1 for lighting, 2 for TAA); `frag` names the
@@ -104,6 +139,7 @@ const BuildParams = struct {
     color_formats: []const vk.Format,
     depth_format: vk.Format,
     depth_test: bool,
+    push_constant_size: u32 = 0, // 0 = no push constants (vertex stage if > 0)
 };
 
 /// Shared pipeline construction. Most of this is boilerplate fixed-function
@@ -187,9 +223,12 @@ fn build(ctx: *const Context, p: BuildParams) !Pipeline {
         .p_dynamic_states = &dynamic_states,
     };
 
+    const push_ranges = [_]vk.PushConstantRange{.{ .stage_flags = .{ .vertex_bit = true }, .offset = 0, .size = p.push_constant_size }};
     const layout = try vkd.createPipelineLayout(dev, &.{
         .set_layout_count = 1,
         .p_set_layouts = &.{p.set_layout},
+        .push_constant_range_count = if (p.push_constant_size > 0) 1 else 0,
+        .p_push_constant_ranges = &push_ranges,
     }, null);
     errdefer vkd.destroyPipelineLayout(dev, layout, null);
 

@@ -85,3 +85,59 @@ pub const Uniforms = extern struct {
 pub const ChunkData = extern struct {
     origin: [4]f32, // xyz used, w padding
 };
+
+// --- entity (player avatar) rendering ---
+//
+// Remote players are drawn as lit boxes in the G-buffer. A shared unit-cube mesh
+// is sized/positioned per entity in the vertex shader from a push constant.
+
+/// A vertex of the avatar cube: local position (0..1) + flat face normal.
+pub const EntityVertex = extern struct {
+    pos: [3]f32,
+    normal: [3]f32,
+
+    pub const binding = vk.VertexInputBindingDescription{
+        .binding = 0,
+        .stride = @sizeOf(EntityVertex),
+        .input_rate = .vertex,
+    };
+    pub const attributes = [_]vk.VertexInputAttributeDescription{
+        .{ .location = 0, .binding = 0, .format = .r32g32b32_sfloat, .offset = 0 },
+        .{ .location = 1, .binding = 0, .format = .r32g32b32_sfloat, .offset = @offsetOf(EntityVertex, "normal") },
+    };
+};
+
+/// Per-avatar push constant: feet position + colour.
+pub const EntityPush = extern struct {
+    pos: [4]f32, // xyz = feet position; w unused
+    color: [4]f32, // rgb = avatar colour; a unused
+};
+
+/// A remote player to draw this frame (built by the client from replicated state).
+pub const EntityInstance = struct {
+    pos: [3]f32,
+    color: [3]f32,
+};
+
+/// Unit-cube (0..1) mesh, 36 vertices, flat per-face normals. The entity vertex
+/// shader scales it to a player-sized box (0.6 × 1.8 × 0.6) at the entity's feet.
+pub const cube_vertices = blk: {
+    const CubeFace = struct { n: [3]f32, c: [4][3]f32 };
+    const faces = [6]CubeFace{
+        .{ .n = .{ 1, 0, 0 }, .c = .{ .{ 1, 0, 0 }, .{ 1, 1, 0 }, .{ 1, 1, 1 }, .{ 1, 0, 1 } } },
+        .{ .n = .{ -1, 0, 0 }, .c = .{ .{ 0, 0, 1 }, .{ 0, 1, 1 }, .{ 0, 1, 0 }, .{ 0, 0, 0 } } },
+        .{ .n = .{ 0, 1, 0 }, .c = .{ .{ 0, 1, 0 }, .{ 0, 1, 1 }, .{ 1, 1, 1 }, .{ 1, 1, 0 } } },
+        .{ .n = .{ 0, -1, 0 }, .c = .{ .{ 0, 0, 0 }, .{ 1, 0, 0 }, .{ 1, 0, 1 }, .{ 0, 0, 1 } } },
+        .{ .n = .{ 0, 0, 1 }, .c = .{ .{ 1, 0, 1 }, .{ 1, 1, 1 }, .{ 0, 1, 1 }, .{ 0, 0, 1 } } },
+        .{ .n = .{ 0, 0, -1 }, .c = .{ .{ 0, 0, 0 }, .{ 0, 1, 0 }, .{ 1, 1, 0 }, .{ 1, 0, 0 } } },
+    };
+    var v: [36]EntityVertex = undefined;
+    var i: usize = 0;
+    for (faces) |f| {
+        for ([6]usize{ 0, 1, 2, 0, 2, 3 }) |ci| {
+            v[i] = .{ .pos = f.c[ci], .normal = f.n };
+            i += 1;
+        }
+    }
+    break :blk v;
+};
