@@ -75,6 +75,15 @@ pub fn main(init: std.process.Init) !void {
     loadWorld(io, alloc, &world) catch |err| std.log.warn("world load failed: {}", .{err});
     defer saveWorld(io, alloc, &world) catch |err| std.log.warn("world save failed: {}", .{err});
 
+    // Authoritative server + the client/server connection. Single-player runs both
+    // in one process: the client (the run loop) never mutates the world directly —
+    // it sends actions through the connection, and the server (which owns the
+    // world) applies them on its fixed tick and emits events back. Swapping the
+    // connection for a socket is what turns this into multiplayer.
+    var conn = zig_test.connection.Connection.init(alloc);
+    defer conn.deinit();
+    var server = zig_test.server.Server.init(&world, &conn);
+
     var renderer = try Renderer.init(&vulkan, &swapchain, capacity, 16384, 24576);
     defer renderer.deinit(&vulkan);
 
@@ -87,7 +96,7 @@ pub fn main(init: std.process.Init) !void {
     defer stream.deinit();
     std.debug.print("world: streaming, radius {d} chunks, capacity {d}\n", .{ radius, capacity });
 
-    try runLoop(io, window, &vulkan, &swapchain, &renderer, &stream);
+    try runLoop(io, window, &vulkan, &swapchain, &renderer, &stream, &server, &conn);
 }
 
 /// Where player edits are persisted (a compact diff from the generated world).
@@ -255,6 +264,8 @@ fn runLoop(
     swapchain: *Swapchain,
     renderer: *Renderer,
     stream: *Stream,
+    server: *zig_test.server.Server,
+    conn: *zig_test.connection.Connection,
 ) !void {
     //region Setup (timing, camera, mouse capture)
     // A high-resolution counter that ticks `freq` times per second. Dividing a
@@ -343,16 +354,19 @@ fn runLoop(
                     // Aim a ray from the camera; left = break, right = place.
                     // Skipped while the overlay has the mouse.
                     if (!ui_focus) {
+                        // Don't edit the world here — send an action to the server,
+                        // which validates + applies it and emits an event we react
+                        // to below. The raycast only *reads* the world (allowed).
                         if (zig_test.raycast.raycastVoxel(stream.world, cam.position, cam.forward(), 6.0)) |h| {
                             if (event.button.button == c.SDL_BUTTON_LEFT) {
-                                try stream.editBlock(vulkan, h.block[0], h.block[1], h.block[2], .air);
-                                renderer.editShadowVoxel(stream.world, h.block[0], h.block[1], h.block[2]);
+                                conn.sendAction(.{ .set_block = .{ .x = h.block[0], .y = h.block[1], .z = h.block[2], .block = .air } });
                             } else if (event.button.button == c.SDL_BUTTON_RIGHT) {
-                                const px = h.block[0] + h.normal[0];
-                                const py = h.block[1] + h.normal[1];
-                                const pz = h.block[2] + h.normal[2];
-                                try stream.editBlock(vulkan, px, py, pz, .stone);
-                                renderer.editShadowVoxel(stream.world, px, py, pz);
+                                conn.sendAction(.{ .set_block = .{
+                                    .x = h.block[0] + h.normal[0],
+                                    .y = h.block[1] + h.normal[1],
+                                    .z = h.block[2] + h.normal[2],
+                                    .block = .stone,
+                                } });
                             }
                         }
                     }
@@ -360,6 +374,20 @@ fn runLoop(
                 else => {},
             }
         }
+
+        // 2b. Server: advance the authoritative sim (fixed tick), applying any
+        //     actions the client queued above. Then drain the events it emitted
+        //     and apply them to the client's view — re-mesh the changed chunk(s)
+        //     and patch the shadow volume. This is the client/server round-trip;
+        //     today it's in-process, tomorrow it's a socket.
+        server.tick(@floatCast(dt));
+        for (conn.eventsSlice()) |ev| switch (ev) {
+            .block_changed => |b| {
+                stream.applyBlockChange(vulkan, b.x, b.y, b.z) catch |err| std.log.warn("remesh failed: {}", .{err});
+                renderer.editShadowVoxel(stream.world, b.x, b.y, b.z);
+            },
+        };
+        conn.clearEvents();
 
         // 3. Input state: a snapshot array of every key, indexed by scancode.
         //    Unlike events, this tells us what's held RIGHT NOW — exactly what

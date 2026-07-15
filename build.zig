@@ -167,6 +167,16 @@ pub fn build(b: *std.Build) void {
     const run_cmd = b.addRunArtifact(exe);
     run_step.dependOn(&run_cmd.step);
 
+    // Make `zig build run` find the Vulkan loader + MoltenVK ICD at runtime even
+    // from a shell that hasn't sourced the SDK's setup-env.sh (the loader lives in
+    // the SDK, not a system path on macOS). Only affects this run step, not the
+    // installed binary.
+    if (target.result.os.tag == .macos) {
+        const sdk = macosVulkanSdk(b); // the SDK's macOS dir
+        run_cmd.setEnvironmentVariable("DYLD_LIBRARY_PATH", b.pathJoin(&.{ sdk, "lib" }));
+        run_cmd.setEnvironmentVariable("VK_ICD_FILENAMES", b.pathJoin(&.{ sdk, "share", "vulkan", "icd.d", "MoltenVK_icd.json" }));
+    }
+
     // By making the run step depend on the default step, it will be run from the
     // installation directory rather than directly from within the cache directory.
     run_cmd.step.dependOn(b.getInstallStep());
@@ -244,6 +254,14 @@ fn addShader(b: *std.Build, exe: *std.Build.Step.Compile, src: []const u8, impor
 fn vulkanIncludePath(b: *std.Build) []const u8 {
     if (b.graph.environ_map.get("VULKAN_SDK")) |sdk| return b.pathJoin(&.{ sdk, "include" });
     return "/Users/kalob/VulkanSDK/1.4.341.1/macOS/include";
+}
+
+/// The Vulkan SDK's macOS directory (holds `lib/` and the MoltenVK ICD). When the
+/// SDK's setup-env.sh is sourced, `$VULKAN_SDK` already points here; otherwise
+/// fall back to this dev machine's install.
+fn macosVulkanSdk(b: *std.Build) []const u8 {
+    if (b.graph.environ_map.get("VULKAN_SDK")) |sdk| return sdk;
+    return "/Users/kalob/VulkanSDK/1.4.341.1/macOS";
 }
 
 /// Locate `glslc`. Prefer the one in the Vulkan SDK (`$VULKAN_SDK/bin`); fall

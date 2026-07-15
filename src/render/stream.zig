@@ -147,13 +147,12 @@ pub const Stream = struct {
         }
     }
 
-    /// Apply a single block edit and re-mesh the affected chunk(s). This is the
-    /// **one place** world mutation happens — the seed of the server's
-    /// authoritative "apply action" handler. Edits are in-memory only for now;
-    /// they're lost if the chunk is evicted (persistence is a later step).
-    pub fn editBlock(self: *Stream, ctx: *const Context, wx: i32, wy: i32, wz: i32, block: BlockId) !void {
-        try self.world.setBlock(wx, wy, wz, block);
-
+    /// React to a server-confirmed block change by re-meshing the affected
+    /// chunk(s). The world has already been mutated authoritatively on the server
+    /// side of the `Connection`, so this does **no** `setBlock` itself — it's the
+    /// *client's* view update (mesh + shadow volume follow). In multiplayer this
+    /// is where a replicated world would be updated from the event before meshing.
+    pub fn applyBlockChange(self: *Stream, ctx: *const Context, wx: i32, wy: i32, wz: i32) !void {
         const cx = @divFloor(wx, chunk_size);
         const cy = @divFloor(wy, chunk_size);
         const cz = @divFloor(wz, chunk_size);
