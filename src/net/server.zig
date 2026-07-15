@@ -9,7 +9,7 @@
 //! clean boundary even while nearly empty.
 
 const std = @import("std");
-const World = @import("world.zig").World;
+const World = @import("../world/world.zig").World;
 const Connection = @import("connection.zig").Connection;
 const protocol = @import("protocol.zig");
 
@@ -73,7 +73,7 @@ test "server applies a set_block action on tick and emits an event" {
     conn.sendAction(.{ .set_block = .{ .x = 5, .y = 6, .z = 7, .block = .stone } });
     server.tick(1.0); // plenty of ticks; action processed on the first
 
-    try testing.expectEqual(@import("block.zig").BlockId.stone, world.blockAt(5, 6, 7));
+    try testing.expectEqual(@import("../world/block.zig").BlockId.stone, world.blockAt(5, 6, 7));
     try testing.expectEqual(@as(usize, 1), conn.eventsSlice().len);
     try testing.expectEqual(@as(usize, 0), conn.actionsSlice().len); // drained
 }

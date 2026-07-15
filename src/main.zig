@@ -8,8 +8,8 @@ const chunkMesh = @import("render/chunk_mesh.zig");
 const mesh = @import("render/mesh.zig");
 const Stream = @import("render/stream.zig").Stream;
 const ui = @import("ui.zig");
-const net = @import("net.zig");
-const net_server = @import("net_server.zig");
+const net = @import("net/net.zig");
+const net_server = @import("net/net_server.zig");
 
 //region SDL (C interop)
 // Pull SDL's C header straight into Zig. `@cImport` runs the C preprocessor and

@@ -1,17 +1,17 @@
 //! Root source file for the `zig_test` package — re-exports the game modules.
 const std = @import("std");
 
-pub const block = @import("block.zig");
-pub const chunk = @import("chunk.zig");
-pub const world = @import("world.zig");
+pub const block = @import("world/block.zig");
+pub const chunk = @import("world/chunk.zig");
+pub const world = @import("world/world.zig");
 pub const math = @import("math.zig");
-pub const camera = @import("camera.zig");
-pub const raycast = @import("raycast.zig");
-pub const player = @import("player.zig");
-pub const noise = @import("noise.zig");
-pub const protocol = @import("protocol.zig");
-pub const connection = @import("connection.zig");
-pub const server = @import("server.zig");
+pub const camera = @import("game/camera.zig");
+pub const raycast = @import("world/raycast.zig");
+pub const player = @import("game/player.zig");
+pub const noise = @import("world/noise.zig");
+pub const protocol = @import("net/protocol.zig");
+pub const connection = @import("net/connection.zig");
+pub const server = @import("net/server.zig");
 
 // Ensure the tests inside the game modules are discovered and run by
 // `zig build test`, not just the ones written directly in this file.

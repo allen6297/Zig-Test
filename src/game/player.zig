@@ -7,8 +7,8 @@
 //! `pos` is the **feet** position: centred on x/z, at the bottom on y.
 
 const std = @import("std");
-const World = @import("world.zig").World;
-const Vec3 = @import("math.zig").Vec3;
+const World = @import("../world/world.zig").World;
+const Vec3 = @import("../math.zig").Vec3;
 
 pub const Player = struct {
     pos: Vec3,

@@ -8,7 +8,7 @@
 //! world itself; it asks, and reacts to what the server confirms.
 
 const std = @import("std");
-const BlockId = @import("block.zig").BlockId;
+const BlockId = @import("../world/block.zig").BlockId;
 
 /// A block set at a world coordinate. Used as both a client request (Action) and
 /// the server's confirmation (Event) — the payload is identical.

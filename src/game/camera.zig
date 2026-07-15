@@ -4,7 +4,7 @@
 //! renderer that will eventually use it.
 
 const std = @import("std");
-const math = @import("math.zig");
+const math = @import("../math.zig");
 const Vec3 = math.Vec3;
 const Mat4 = math.Mat4;
 

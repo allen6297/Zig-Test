@@ -5,7 +5,7 @@
 
 const std = @import("std");
 const World = @import("world.zig").World;
-const Vec3 = @import("math.zig").Vec3;
+const Vec3 = @import("../math.zig").Vec3;
 
 pub const Hit = struct {
     /// The solid block the ray hit.
