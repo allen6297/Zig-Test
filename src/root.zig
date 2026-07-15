@@ -24,5 +24,6 @@ test {
     std.testing.refAllDecls(raycast);
     std.testing.refAllDecls(player);
     std.testing.refAllDecls(noise);
+    std.testing.refAllDecls(protocol);
     std.testing.refAllDecls(server);
 }

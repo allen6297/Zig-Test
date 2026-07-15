@@ -8,6 +8,7 @@ const chunkMesh = @import("render/chunk_mesh.zig");
 const Stream = @import("render/stream.zig").Stream;
 const ui = @import("ui.zig");
 const net = @import("net.zig");
+const net_server = @import("net_server.zig");
 
 //region SDL (C interop)
 // Pull SDL's C header straight into Zig. `@cImport` runs the C preprocessor and
@@ -25,16 +26,45 @@ const c = @cImport({
 pub fn main(init: std.process.Init) !void {
     const io = init.io; // for world save/load file I/O
 
-    // `--nettest`: headless ENet loopback smoke test (no window). Verifies the
-    // transport end-to-end without a second process; exits when done.
+    // Parse CLI: run mode + networking options.
+    //   (default)          single-player (integrated client+server, in-process)
+    //   --server [--port N] dedicated headless server (no window)
+    //   --connect <host>    client connecting to a server
+    //   --nettest           headless ENet loopback self-test, then exit
+    var mode: enum { single_player, server, client } = .single_player;
+    var port: u16 = net.default_port;
+    var host_buf: [64]u8 = undefined;
+    var connect_host: [:0]const u8 = "127.0.0.1";
+    var client_test = false;
     {
         var it = std.process.Args.Iterator.init(init.minimal.args);
         defer it.deinit();
         _ = it.skip(); // program name
         while (it.next()) |arg| {
             if (std.mem.eql(u8, arg, "--nettest")) return net.selfTest();
+            if (std.mem.eql(u8, arg, "--clienttest")) {
+                client_test = true;
+            } else if (std.mem.eql(u8, arg, "--server")) {
+                mode = .server;
+            } else if (std.mem.eql(u8, arg, "--connect")) {
+                mode = .client;
+                if (it.next()) |h| connect_host = std.fmt.bufPrintZ(&host_buf, "{s}", .{h}) catch connect_host;
+            } else if (std.mem.eql(u8, arg, "--port")) {
+                if (it.next()) |p| port = std.fmt.parseInt(u16, p, 10) catch port;
+            }
         }
     }
+
+    // Headless client protocol test against a running --server (port parsed above).
+    if (client_test) return net.clientTest(port);
+
+    // Dedicated server: no window, no rendering — just the world + sim + ENet.
+    if (mode == .server) {
+        var sgpa: std.heap.DebugAllocator(.{}) = .init;
+        defer _ = sgpa.deinit();
+        return net_server.run(sgpa.allocator(), port, genChunk);
+    }
+    const is_client = mode == .client;
 
     // Bring up SDL's video subsystem. SDL3 returns `true` on success (SDL2
     // returned 0 — the API flipped), so a falsy result means failure.
@@ -83,18 +113,31 @@ pub fn main(init: std.process.Init) !void {
 
     var world = zig_test.world.World.init(alloc, genChunk);
     defer world.deinit();
-    // Load saved edits (diff from generated terrain); no-op on first run.
-    loadWorld(io, alloc, &world) catch |err| std.log.warn("world load failed: {}", .{err});
-    defer saveWorld(io, alloc, &world) catch |err| std.log.warn("world save failed: {}", .{err});
+    // Single-player owns the world save file; a client's world is authoritative on
+    // the server and synced over the network, so it doesn't touch the local file.
+    if (!is_client) loadWorld(io, alloc, &world) catch |err| std.log.warn("world load failed: {}", .{err});
+    defer if (!is_client) saveWorld(io, alloc, &world) catch |err| std.log.warn("world save failed: {}", .{err});
 
-    // Authoritative server + the client/server connection. Single-player runs both
-    // in one process: the client (the run loop) never mutates the world directly —
-    // it sends actions through the connection, and the server (which owns the
-    // world) applies them on its fixed tick and emits events back. Swapping the
-    // connection for a socket is what turns this into multiplayer.
+    // Single-player: authoritative server + in-process connection in one process.
+    // The client (the run loop) never mutates the world directly — it sends
+    // actions through the connection, and the server applies them on its fixed
+    // tick and emits events back. In multiplayer the connection is an ENet socket
+    // to a remote server instead (see below); these stay unused then.
     var conn = zig_test.connection.Connection.init(alloc);
     defer conn.deinit();
     var server = zig_test.server.Server.init(&world, &conn);
+
+    // Client: connect to the server and sync the world edit-diff *before* we start
+    // rendering, so streamed chunks mesh the correct (already-edited) world.
+    var net_client: ?net.NetClient = null;
+    if (is_client) {
+        try net.init();
+        net_client = try net.NetClient.connect(connect_host.ptr, port);
+        std.debug.print("client: connecting to {s}:{d}\n", .{ connect_host, port });
+        syncFromServer(&net_client.?, &world);
+    }
+    defer if (is_client) net.deinit();
+    defer if (net_client) |*nc| nc.deinit();
 
     var renderer = try Renderer.init(&vulkan, &swapchain, capacity, 16384, 24576);
     defer renderer.deinit(&vulkan);
@@ -108,7 +151,35 @@ pub fn main(init: std.process.Init) !void {
     defer stream.deinit();
     std.debug.print("world: streaming, radius {d} chunks, capacity {d}\n", .{ radius, capacity });
 
-    try runLoop(io, window, &vulkan, &swapchain, &renderer, &stream, &server, &conn);
+    var nc_ptr: ?*net.NetClient = null;
+    if (net_client) |*nc| nc_ptr = nc;
+    try runLoop(io, window, &vulkan, &swapchain, &renderer, &stream, &server, &conn, nc_ptr);
+}
+
+/// Client join sync: pump the connection until the server's world snapshot
+/// arrives (the edit-diff), and apply it to the local world. Times out after a
+/// few seconds and continues with locally-generated terrain if none comes.
+fn syncFromServer(nc: *net.NetClient, world: *zig_test.world.World) void {
+    var iter: u32 = 0;
+    while (iter < 500) : (iter += 1) {
+        var ev: net.c.NzEvent = undefined;
+        while (net.c.nz_service(nc.host, &ev, 10) > 0) {
+            var synced = false;
+            if (ev.kind == net.c.NZ_RECEIVE and ev.len > 0) {
+                if (zig_test.protocol.decodeServerMessage(ev.data[0..ev.len])) |msg| switch (msg) {
+                    .snapshot => |s| {
+                        world.deserialize(s) catch |e| std.log.warn("snapshot apply failed: {}", .{e});
+                        std.debug.print("client: synced {d} edit bytes from server\n", .{s.len});
+                        synced = true;
+                    },
+                    else => {},
+                };
+            }
+            net.c.nz_free_packet(&ev);
+            if (synced) return;
+        }
+    }
+    std.debug.print("client: no snapshot received; using local terrain\n", .{});
 }
 
 /// Where player edits are persisted (a compact diff from the generated world).
@@ -278,6 +349,7 @@ fn runLoop(
     stream: *Stream,
     server: *zig_test.server.Server,
     conn: *zig_test.connection.Connection,
+    net_client: ?*net.NetClient,
 ) !void {
     //region Setup (timing, camera, mouse capture)
     // A high-resolution counter that ticks `freq` times per second. Dividing a
@@ -369,16 +441,22 @@ fn runLoop(
                         // Don't edit the world here — send an action to the server,
                         // which validates + applies it and emits an event we react
                         // to below. The raycast only *reads* the world (allowed).
+                        // In single-player the action goes to the in-process server;
+                        // as a client it goes over the socket.
                         if (zig_test.raycast.raycastVoxel(stream.world, cam.position, cam.forward(), 6.0)) |h| {
-                            if (event.button.button == c.SDL_BUTTON_LEFT) {
-                                conn.sendAction(.{ .set_block = .{ .x = h.block[0], .y = h.block[1], .z = h.block[2], .block = .air } });
-                            } else if (event.button.button == c.SDL_BUTTON_RIGHT) {
-                                conn.sendAction(.{ .set_block = .{
+                            const maybe_action: ?zig_test.protocol.Action = if (event.button.button == c.SDL_BUTTON_LEFT)
+                                .{ .set_block = .{ .x = h.block[0], .y = h.block[1], .z = h.block[2], .block = .air } }
+                            else if (event.button.button == c.SDL_BUTTON_RIGHT)
+                                .{ .set_block = .{
                                     .x = h.block[0] + h.normal[0],
                                     .y = h.block[1] + h.normal[1],
                                     .z = h.block[2] + h.normal[2],
                                     .block = .stone,
-                                } });
+                                } }
+                            else
+                                null;
+                            if (maybe_action) |action| {
+                                if (net_client) |nc| nc.sendAction(action) else conn.sendAction(action);
                             }
                         }
                     }
@@ -387,19 +465,36 @@ fn runLoop(
             }
         }
 
-        // 2b. Server: advance the authoritative sim (fixed tick), applying any
-        //     actions the client queued above. Then drain the events it emitted
-        //     and apply them to the client's view — re-mesh the changed chunk(s)
-        //     and patch the shadow volume. This is the client/server round-trip;
-        //     today it's in-process, tomorrow it's a socket.
-        server.tick(@floatCast(dt));
-        for (conn.eventsSlice()) |ev| switch (ev) {
-            .block_changed => |b| {
-                stream.applyBlockChange(vulkan, b.x, b.y, b.z) catch |err| std.log.warn("remesh failed: {}", .{err});
-                renderer.editShadowVoxel(stream.world, b.x, b.y, b.z);
-            },
-        };
-        conn.clearEvents();
+        // 2b. Client/server round-trip: get block-change events and apply them to
+        //     the view. Single-player advances the in-process server and drains its
+        //     connection; a networked client instead pumps events off the socket
+        //     (and must update its own replicated world, which the local server
+        //     would otherwise have done).
+        if (net_client) |nc| {
+            var nev: net.c.NzEvent = undefined;
+            while (net.c.nz_service(nc.host, &nev, 0) > 0) {
+                if (nev.kind == net.c.NZ_RECEIVE and nev.len > 0) {
+                    if (zig_test.protocol.decodeServerMessage(nev.data[0..nev.len])) |msg| switch (msg) {
+                        .block_changed => |b| {
+                            stream.world.setBlock(b.x, b.y, b.z, b.block) catch {};
+                            stream.applyBlockChange(vulkan, b.x, b.y, b.z) catch {};
+                            renderer.editShadowVoxel(stream.world, b.x, b.y, b.z);
+                        },
+                        .snapshot => {}, // initial sync happens before the loop
+                    };
+                }
+                net.c.nz_free_packet(&nev);
+            }
+        } else {
+            server.tick(@floatCast(dt));
+            for (conn.eventsSlice()) |ev| switch (ev) {
+                .block_changed => |b| {
+                    stream.applyBlockChange(vulkan, b.x, b.y, b.z) catch |err| std.log.warn("remesh failed: {}", .{err});
+                    renderer.editShadowVoxel(stream.world, b.x, b.y, b.z);
+                },
+            };
+            conn.clearEvents();
+        }
 
         // 3. Input state: a snapshot array of every key, indexed by scancode.
         //    Unlike events, this tells us what's held RIGHT NOW — exactly what
