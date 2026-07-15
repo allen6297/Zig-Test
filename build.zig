@@ -140,9 +140,10 @@ pub fn build(b: *std.Build) void {
     // A thin C shim (net_shim.c) implements a minimal API over ENet and compiles
     // ENet itself. Source `@cImport`s net_shim.h — not enet.h — so translate-c
     // never has to digest macOS system socket/mach headers. `-w` silences ENet's
-    // own C warnings.
+    // own C warnings; `-fno-sanitize=undefined` because ENet's retransmit logic
+    // does a benign `1u << 32` shift that Debug UBSan would otherwise abort on.
     exe.root_module.addIncludePath(b.path("vendor/enet"));
-    exe.root_module.addCSourceFile(.{ .file = b.path("vendor/enet/net_shim.c"), .flags = &.{"-w"} });
+    exe.root_module.addCSourceFile(.{ .file = b.path("vendor/enet/net_shim.c"), .flags = &.{ "-w", "-fno-sanitize=undefined" } });
     //endregion
 
     //region shaders (GLSL -> SPIR-V)
