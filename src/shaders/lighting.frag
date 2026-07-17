@@ -31,13 +31,31 @@ layout(binding = 4) uniform sampler3D shadow_vol; // r = solidity (1 = solid)
 
 layout(location = 0) out vec4 out_color;
 
-// Sky colour along a world-space view ray: horizon→zenith gradient plus a warm
-// glow toward the sun (bloom of sunrise/sunset, sun disk near the direction).
+// Sky colour along a world-space view ray: horizon→zenith gradient, a warm glow
+// toward the sun (sunrise/sunset bloom + sun disk), and — as the sun drops below
+// the horizon — a moon and a field of stars fading in.
 vec3 skyColor(vec3 dir) {
     float up = clamp(dir.y, 0.0, 1.0);
     vec3 col = mix(u.sky_horizon.rgb, u.sky_zenith.rgb, pow(up, 0.5));
+
     float sun_amt = max(dot(dir, u.sun_dir.xyz), 0.0);
     col += u.sun_color.rgb * (0.2 * pow(sun_amt, 8.0) + pow(sun_amt, 256.0));
+
+    // Night sky: fades in as the sun sinks; only above the horizon.
+    float night = 1.0 - smoothstep(-0.1, 0.2, u.sun_dir.y);
+    if (night > 0.0 && dir.y > 0.0) {
+        // Moon: a soft disk opposite the sun (rises as the sun sets).
+        vec3 moon_dir = -normalize(u.sun_dir.xyz);
+        float md = dot(dir, moon_dir);
+        float moon = smoothstep(0.9993, 0.9997, md) + 0.4 * pow(max(md, 0.0), 500.0);
+        col += vec3(0.85, 0.87, 1.0) * moon * night;
+
+        // Stars: sparse hashed points, denser toward the zenith.
+        vec3 cell = floor(dir * 260.0);
+        float h = fract(sin(dot(cell, vec3(12.9898, 78.233, 37.719))) * 43758.5453);
+        float star = smoothstep(0.9968, 0.999, h) * smoothstep(0.02, 0.2, dir.y);
+        col += vec3(star) * night;
+    }
     return col;
 }
 
