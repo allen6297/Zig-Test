@@ -17,6 +17,10 @@ layout(binding = 0) uniform Uniforms {
     vec4 shadow_origin;
     vec4 shadow_dim;
     vec4 sun_dir;
+    vec4 sun_color;
+    vec4 sky_zenith;
+    vec4 sky_horizon;
+    vec4 fog;
 } u;
 
 layout(push_constant) uniform Push {

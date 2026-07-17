@@ -193,6 +193,48 @@ fn removeEntity(entities: []RemoteEntity, id: u32) void {
     };
 }
 
+/// Sun direction + sky/sun colours for a given time of day, all derived from the
+/// sun's height. Drives the day/night cycle, gradient sky, and fog tint.
+const Atmosphere = struct {
+    sun_dir: [3]f32,
+    sun_color: [3]f32,
+    sky_zenith: [3]f32,
+    sky_horizon: [3]f32,
+};
+
+fn lerp3(a: [3]f32, b: [3]f32, t: f32) [3]f32 {
+    return .{ a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t };
+}
+fn smoothstep(e0: f32, e1: f32, x: f32) f32 {
+    const t = std.math.clamp((x - e0) / (e1 - e0), 0.0, 1.0);
+    return t * t * (3.0 - 2.0 * t);
+}
+
+fn computeAtmosphere(time_of_day: f32) Atmosphere {
+    // Sun arc: east at sunrise (6h) → overhead at noon → west at sunset (18h),
+    // below the horizon at night, with a slight southward tilt so shadows angle.
+    const a = time_of_day / 24.0 * std.math.tau;
+    var dir = [3]f32{ @sin(a), -@cos(a), 0.35 };
+    const len = @sqrt(dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]);
+    dir = .{ dir[0] / len, dir[1] / len, dir[2] / len };
+    const height = dir[1]; // sun elevation, -1..1
+
+    const day = smoothstep(-0.05, 0.25, height); // 0 at night, 1 when sun is up
+
+    // Sun colour: warm/orange near the horizon, white overhead, off at night.
+    const tint = lerp3(.{ 1.0, 0.45, 0.2 }, .{ 1.0, 0.95, 0.85 }, smoothstep(0.0, 0.35, height));
+    const sun_color = [3]f32{ tint[0] * day * 1.15, tint[1] * day * 1.15, tint[2] * day * 1.15 };
+
+    const sky_zenith = lerp3(.{ 0.01, 0.02, 0.05 }, .{ 0.20, 0.42, 0.75 }, day);
+
+    // Horizon: pale blue by day, orange at sunrise/sunset, dark at night.
+    const sunset = day * (1.0 - smoothstep(0.0, 0.3, height));
+    const horizon_day = lerp3(.{ 0.55, 0.70, 0.90 }, .{ 0.95, 0.45, 0.22 }, sunset);
+    const sky_horizon = lerp3(.{ 0.02, 0.03, 0.07 }, horizon_day, day);
+
+    return .{ .sun_dir = dir, .sun_color = sun_color, .sky_zenith = sky_zenith, .sky_horizon = sky_horizon };
+}
+
 /// A distinct avatar colour per player, cycled from a small palette by entity id.
 fn entityColor(id: u32) [3]f32 {
     const palette = [_][3]f32{
@@ -430,10 +472,12 @@ fn runLoop(
     var creative = false; // fly + noclip debug mode (toggle: F or the overlay)
     var light_rgb = [3]f32{ 1.0, 0.85, 0.6 };
     var light_intensity: f32 = 3.0;
-    // Sun direction as azimuth (around the horizon) + elevation (above it), in
-    // degrees — live-tuned in the overlay, drives the shadow angle.
-    var sun_azimuth: f32 = 40;
-    var sun_elevation: f32 = 55;
+    // Time of day (0..24 h) drives the sun arc + sky/fog colours. Auto-advances
+    // when `animate_day` is on; `day_length` is real seconds for a full cycle.
+    var time_of_day: f32 = 10.0;
+    var animate_day = true;
+    var day_length: f32 = 120.0;
+    var fog_density: f32 = 0.006;
     var fps_smooth: f32 = 60.0;
     var fps_window: f64 = 0; // time since the displayed FPS was last refreshed
 
@@ -631,15 +675,18 @@ fn runLoop(
             .creative = &creative,
             .light_rgb = &light_rgb,
             .light_intensity = &light_intensity,
-            .sun_azimuth = &sun_azimuth,
-            .sun_elevation = &sun_elevation,
+            .time_of_day = &time_of_day,
+            .animate_day = &animate_day,
+            .day_length = &day_length,
+            .fog_density = &fog_density,
         });
 
-        // Sun direction from the overlay's azimuth/elevation (points toward the sun).
-        const el = std.math.degreesToRadians(sun_elevation);
-        const az = std.math.degreesToRadians(sun_azimuth);
-        const cos_el = @cos(el);
-        const sun_dir = [3]f32{ cos_el * @cos(az), @sin(el), cos_el * @sin(az) };
+        // Day/night: advance the clock and derive the sun arc + sky/fog colours.
+        if (animate_day) {
+            time_of_day += @as(f32, @floatCast(dt)) / @max(day_length, 1.0) * 24.0;
+            time_of_day = @mod(time_of_day, 24.0);
+        }
+        const atmo = computeAtmosphere(time_of_day);
 
         const math = zig_test.math;
         const aspect: f32 = @as(f32, @floatFromInt(swapchain.extent.width)) /
@@ -681,7 +728,11 @@ fn runLoop(
             // Filled in by the renderer from its shadow volume.
             .shadow_origin = .{ 0, 0, 0, 0 },
             .shadow_dim = .{ 0, 0, 0, 0 },
-            .sun_dir = .{ sun_dir[0], sun_dir[1], sun_dir[2], 0 },
+            .sun_dir = .{ atmo.sun_dir[0], atmo.sun_dir[1], atmo.sun_dir[2], 0 },
+            .sun_color = .{ atmo.sun_color[0], atmo.sun_color[1], atmo.sun_color[2], 0 },
+            .sky_zenith = .{ atmo.sky_zenith[0], atmo.sky_zenith[1], atmo.sky_zenith[2], 0 },
+            .sky_horizon = .{ atmo.sky_horizon[0], atmo.sky_horizon[1], atmo.sky_horizon[2], 0 },
+            .fog = .{ 0, 0, 0, fog_density },
         }, planes, entity_instances[0..entity_n], ui.record);
         prev_viewproj = viewproj;
 

@@ -107,8 +107,10 @@ pub const Debug = struct {
     creative: *bool, // fly + noclip debug mode
     light_rgb: *[3]f32,
     light_intensity: *f32,
-    sun_azimuth: *f32, // degrees around the horizon
-    sun_elevation: *f32, // degrees above the horizon
+    time_of_day: *f32, // hours, 0..24
+    animate_day: *bool,
+    day_length: *f32, // real seconds per full day
+    fog_density: *f32,
 };
 
 /// Build the debug window. Widgets that mutate state write through the pointers.
@@ -124,8 +126,10 @@ pub fn debugWindow(d: Debug) void {
         _ = zgui.colorEdit3("Light color", .{ .col = d.light_rgb });
         _ = zgui.sliderFloat("Light intensity", .{ .v = d.light_intensity, .min = 0, .max = 10 });
         zgui.separator();
-        _ = zgui.sliderFloat("Sun azimuth", .{ .v = d.sun_azimuth, .min = 0, .max = 360 });
-        _ = zgui.sliderFloat("Sun elevation", .{ .v = d.sun_elevation, .min = 2, .max = 90 });
+        _ = zgui.checkbox("Animate day", .{ .v = d.animate_day });
+        _ = zgui.sliderFloat("Time of day", .{ .v = d.time_of_day, .min = 0, .max = 24 });
+        _ = zgui.sliderFloat("Day length (s)", .{ .v = d.day_length, .min = 10, .max = 600 });
+        _ = zgui.sliderFloat("Fog", .{ .v = d.fog_density, .min = 0, .max = 0.03 });
         zgui.separator();
         zgui.textUnformatted("` (backtick): toggle mouse / UI    F: creative mode");
     }

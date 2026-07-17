@@ -78,6 +78,10 @@ pub const Uniforms = extern struct {
     shadow_origin: [4]f32,
     shadow_dim: [4]f32,
     sun_dir: [4]f32, // xyz = direction toward the sun (normalized); w unused
+    sun_color: [4]f32, // rgb = sun colour × intensity (0 at night); w unused
+    sky_zenith: [4]f32, // rgb = sky colour straight up
+    sky_horizon: [4]f32, // rgb = sky colour at the horizon (also the fog colour)
+    fog: [4]f32, // w = fog density (exp); xyz unused (fog uses sky_horizon)
 };
 
 /// Per-chunk data, stored in a storage buffer and indexed by `gl_DrawID` during

@@ -18,6 +18,10 @@ layout(binding = 0) uniform Uniforms {
     vec4 shadow_origin; // xyz = world min corner of the shadow voxel volume
     vec4 shadow_dim;    // xyz = shadow volume size in voxels
     vec4 sun_dir;       // xyz = direction toward the sun (normalized)
+    vec4 sun_color;     // rgb = sun colour × intensity (0 at night)
+    vec4 sky_zenith;    // rgb = sky straight up
+    vec4 sky_horizon;   // rgb = sky at the horizon (also the fog colour)
+    vec4 fog;           // w = fog density
 } u;
 
 layout(binding = 1) uniform sampler2D g_albedo;
@@ -27,7 +31,15 @@ layout(binding = 4) uniform sampler3D shadow_vol; // r = solidity (1 = solid)
 
 layout(location = 0) out vec4 out_color;
 
-const vec3 sky_color = vec3(0.01, 0.01, 0.03);
+// Sky colour along a world-space view ray: horizon→zenith gradient plus a warm
+// glow toward the sun (bloom of sunrise/sunset, sun disk near the direction).
+vec3 skyColor(vec3 dir) {
+    float up = clamp(dir.y, 0.0, 1.0);
+    vec3 col = mix(u.sky_horizon.rgb, u.sky_zenith.rgb, pow(up, 0.5));
+    float sun_amt = max(dot(dir, u.sun_dir.xyz), 0.0);
+    col += u.sun_color.rgb * (0.2 * pow(sun_amt, 8.0) + pow(sun_amt, 256.0));
+    return col;
+}
 
 // Reconstruct world position from screen UV + non-linear depth via inv(viewproj).
 vec3 reconstruct(vec2 uv, float depth) {
@@ -77,8 +89,12 @@ float sunShadow(vec3 p, vec3 dir) {
 void main() {
     vec2 uv = gl_FragCoord.xy / u.params.xy;
     float depth = texture(g_depth, uv).r;
-    if (depth >= 1.0) { // cleared depth → no geometry → sky
-        out_color = vec4(sky_color, 1.0);
+
+    // Background: no geometry → draw the gradient sky along the pixel's view ray.
+    if (depth >= 1.0) {
+        vec3 far = reconstruct(uv, 1.0);
+        vec3 dir = normalize(far - u.camera_pos.xyz);
+        out_color = vec4(skyColor(dir), 1.0);
         return;
     }
 
@@ -88,13 +104,12 @@ void main() {
     vec3 N = normalize(texture(g_normal, uv).xyz);
     vec3 P = reconstruct(uv, depth);
 
-    // Hemispherical ambient: a dim, cool sky fill from above fading to a much
-    // darker ground bounce below, so surfaces the sun doesn't reach fall into
-    // shadow instead of being flatly lit. `ao*ao` deepens creases. Kept low
-    // overall so unlit areas read as genuinely dark (contrast/mood).
-    vec3 sky_ambient = vec3(0.09, 0.11, 0.15);
-    vec3 ground_ambient = vec3(0.015, 0.015, 0.02);
+    // Hemispherical ambient from the current sky: zenith tint above fading to a
+    // darker ground bounce below, so unlit surfaces pick up the time-of-day colour
+    // and go genuinely dark at night. `ao*ao` deepens creases.
     float hemi = N.y * 0.5 + 0.5; // 1 up, 0 down
+    vec3 sky_ambient = u.sky_zenith.rgb * 0.5;
+    vec3 ground_ambient = u.sky_horizon.rgb * 0.15;
     vec3 ambient = mix(ground_ambient, sky_ambient, hemi) * (ao * ao);
 
     // Dynamic point light (the player's headlamp) with inverse-square-ish falloff.
@@ -105,22 +120,20 @@ void main() {
     float ndl = max(dot(N, L), 0.0);
     vec3 point = u.light_color.rgb * u.light_color.w * ndl * atten;
 
-    // Directional sun (warm), with a raymarched hard shadow: march a ray through
-    // the voxel volume toward the sun and kill the sun term if a solid block
-    // occludes it. Biased off the surface along the normal to avoid acne. The sun
-    // direction is live-tunable from the debug overlay.
-    //
-    // The headlamp *fills* the shadow it reaches so we don't see hard sun-shadows
-    // right where the light is. The fill is **distance-only** (`atten`), not
-    // `ndl·atten` — an ndl-based fill wrongly spared viewer-facing side faces
-    // (bright normals) while shadowing top faces, so shadows showed on tops but
-    // not sides. Distance-only treats every face the same. Far from the light,
-    // shadows stay full-strength.
+    // Directional sun (time-of-day colour), with a raymarched hard shadow. The
+    // headlamp *fills* the shadow it reaches (distance-only) so we don't see hard
+    // sun-shadows right under the light.
     vec3 sun_dir = normalize(u.sun_dir.xyz);
-    vec3 sun_col = vec3(1.0, 0.96, 0.86);
     float shadow = max(sunShadow(P + N * 0.05, sun_dir), atten);
-    float sun = max(dot(N, sun_dir), 0.0) * 0.9 * shadow;
+    float sun = max(dot(N, sun_dir), 0.0) * shadow;
 
-    vec3 color = albedo * (ambient + sun_col * sun + point);
+    vec3 color = albedo * (ambient + point) + albedo * u.sun_color.rgb * sun;
+
+    // Distance fog: fade toward the horizon sky colour so far terrain melts into
+    // the sky (and hides the streaming edge). Exponential by view distance.
+    float view_dist = length(P - u.camera_pos.xyz);
+    float f = 1.0 - exp(-view_dist * u.fog.w);
+    color = mix(color, u.sky_horizon.rgb, f);
+
     out_color = vec4(color, 1.0);
 }
