@@ -104,27 +104,121 @@ float sunShadow(vec3 p, vec3 dir) {
     return 1.0;
 }
 
-// Reflective water: an animated ripple normal, a Fresnel blend between a deep
-// tint (looking straight down) and the reflected sky (grazing angles), and a
-// sharp sun glint. `shadow` dims the glint where the sun is occluded.
+// --- physically-based water helpers ---
+
+// Schlick Fresnel: reflectance rising from F0 (head-on) to 1 (grazing).
+float fresnelSchlick(float cosT, float F0) {
+    float m = clamp(1.0 - cosT, 0.0, 1.0);
+    float m2 = m * m;
+    return F0 + (1.0 - F0) * m2 * m2 * m;
+}
+float D_GGX(float NoH, float a) { // Trowbridge–Reitz normal distribution
+    float a2 = a * a;
+    float d = (NoH * NoH) * (a2 - 1.0) + 1.0;
+    return a2 / (3.14159265 * d * d);
+}
+float V_Smith(float NoV, float NoL, float a) { // height-correlated visibility (folds in 1/4NoVNoL)
+    float k = a * 0.5;
+    return 0.5 / max(NoL * (NoV * (1.0 - k) + k) + NoV * (NoL * (1.0 - k) + k), 1e-5);
+}
+// One direct-light GGX specular lobe — a roughness-shaped glint (sun or moon).
+vec3 ggxLobe(vec3 Nw, vec3 V, vec3 L, float NoV, float a, float F0, vec3 light_col) {
+    vec3 H = normalize(L + V);
+    float NoL = max(dot(Nw, L), 0.0);
+    float NoH = max(dot(Nw, H), 0.0);
+    float VoH = max(dot(V, H), 0.0);
+    return light_col * (D_GGX(NoH, a) * V_Smith(NoV, NoL, a) * fresnelSchlick(VoH, F0) * NoL);
+}
+// March a ray through the shadow voxel volume to the first solid voxel and return
+// the distance (used downward from the surface to recover water-column depth for
+// absorption). Same Amanatides–Woo traversal as sunShadow.
+float voxelDist(vec3 p, vec3 dir, float maxd) {
+    vec3 dim = u.shadow_dim.xyz;
+    vec3 local = p - u.shadow_origin.xyz;
+    ivec3 vox = ivec3(floor(local));
+    ivec3 vstep = ivec3(sign(dir));
+    vec3 inv = 1.0 / max(abs(dir), vec3(1e-6));
+    vec3 tmax = vec3(
+        (dir.x > 0.0 ? (float(vox.x + 1) - local.x) : (local.x - float(vox.x))) * inv.x,
+        (dir.y > 0.0 ? (float(vox.y + 1) - local.y) : (local.y - float(vox.y))) * inv.y,
+        (dir.z > 0.0 ? (float(vox.z + 1) - local.z) : (local.z - float(vox.z))) * inv.z);
+    float t = 0.0;
+    for (int i = 0; i < 48; i++) {
+        if (tmax.x < tmax.y && tmax.x < tmax.z) { vox.x += vstep.x; t = tmax.x; tmax.x += inv.x; }
+        else if (tmax.y < tmax.z) { vox.y += vstep.y; t = tmax.y; tmax.y += inv.y; }
+        else { vox.z += vstep.z; t = tmax.z; tmax.z += inv.z; }
+        if (any(lessThan(vox, ivec3(0))) || any(greaterThanEqual(vox, ivec3(dim))) || t > maxd) return maxd;
+        if (texelFetch(shadow_vol, vox, 0).r > 0.5) return t;
+    }
+    return maxd;
+}
+
+// Physically-based water: energy-correct Fresnel split between an absorptive body
+// colour (Beer–Lambert over the water column, tied to the sky so it darkens at
+// night) and the reflected sky, plus roughness-widened GGX sun/moon glints, a
+// footprint-faded multi-octave ripple normal, and shoreline foam.
 vec3 waterShade(vec3 P, vec3 N, float shadow) {
     vec3 V = normalize(u.camera_pos.xyz - P);
-    float t = u.fog.x; // elapsed seconds (wave animation)
+    float t = u.fog.x; // elapsed seconds
+    float dist = length(u.camera_pos.xyz - P);
 
-    // Small moving ripples perturbing the surface normal (x/z only, keeps it up).
-    vec3 Nw = normalize(N + vec3(
-        0.10 * sin(P.x * 0.8 + t * 1.6) + 0.06 * sin(P.z * 1.7 - t * 1.1),
-        0.0,
-        0.10 * cos(P.z * 0.9 + t * 1.4) + 0.06 * cos(P.x * 1.5 + t * 0.9)));
+    // Multi-octave sum-of-sines slope, each octave faded out once its wavelength
+    // drops below a pixel (kills specular aliasing → TAA fireflies). Only perturb
+    // flat +Y tops; vertical water faces keep their true normal.
+    vec2 grad = vec2(0.0);
+    float amp = 1.0, freq = 0.35, amp_sum = 0.0, extra_rough = 0.0;
+    const mat2 rot = mat2(0.786, -0.618, 0.618, 0.786);
+    vec2 wdir = normalize(vec2(0.8, 0.35));
+    float texel = dist / u.params.y;
+    for (int i = 0; i < 5; i++) {
+        float fade = 1.0 - smoothstep(0.6, 1.4, texel * freq);
+        float ph = dot(wdir, P.xz) * freq + t * (1.0 + float(i) * 0.35);
+        grad += wdir * (amp * freq * cos(ph)) * fade;
+        amp_sum += amp;
+        extra_rough += amp * (1.0 - fade);
+        amp *= 0.62;
+        freq *= 1.75;
+        wdir = rot * wdir;
+    }
+    grad *= 0.16 / max(amp_sum, 1e-3);
+    extra_rough /= max(amp_sum, 1e-3);
+    vec3 Nw = normalize(N + vec3(-grad.x, 0.0, -grad.y) * step(0.5, N.y));
+    float NoV = max(dot(Nw, V), 1e-3);
 
-    const vec3 deep = vec3(0.02, 0.09, 0.16);
-    float fres = pow(1.0 - max(dot(Nw, V), 0.0), 4.0);
-    vec3 refl = skyColor(normalize(reflect(-V, Nw)));
-    vec3 col = mix(deep, refl, clamp(0.05 + 0.9 * fres, 0.0, 1.0));
+    // Roughness grows with distance (subpixel ripples average out) → a broad,
+    // stable far sheen instead of a sparkling mirror that TAA would smear.
+    float rough = clamp(0.03 + 0.10 * (dist / (dist + 40.0)) + 0.25 * extra_rough, 0.02, 0.35);
+    float a = rough * rough;
 
-    // Sun glint: reflect the sun over the ripple normal toward the eye.
-    float spec = pow(max(dot(reflect(-u.sun_dir.xyz, Nw), V), 0.0), 200.0);
-    col += u.sun_color.rgb * spec * shadow;
+    // Water-column depth: refract down and march to the lake floor.
+    vec3 rr = refract(-V, Nw, 0.75);
+    if (rr.y > -0.05) rr = vec3(0.0, -1.0, 0.0); // guard TIR / near-grazing → straight down
+    float depth = voxelDist(P + Nw * 0.02, normalize(rr), 24.0);
+
+    // Beer–Lambert body colour: more absorption (redder loss → blue-green) with
+    // depth, tinted by the current sky so it cools/darkens at night.
+    const vec3 sigma = vec3(0.90, 0.34, 0.22);
+    vec3 absorb = exp(-sigma * depth);
+    vec3 scatter = vec3(0.02, 0.09, 0.13);
+    vec3 body = u.sky_zenith.rgb * absorb + scatter * (1.0 - absorb.b);
+    body = max(body, u.sky_horizon.rgb * 0.02); // faint floor so night water isn't black
+
+    // Environment reflection, energy-correct via Fresnel (F0 = 0.02). Reflection
+    // rays pointing below the horizon fade back to the body → a rippled dark
+    // waterline that keeps the lake from dissolving into the sky.
+    const float F0 = 0.02;
+    float F = fresnelSchlick(NoV, F0);
+    vec3 R = reflect(-V, Nw);
+    vec3 refl = mix(body, skyColor(normalize(R)), smoothstep(0.0, 0.12, R.y));
+    vec3 col = mix(body, refl, F);
+
+    // Direct glints: sun (shadow-gated) + an explicit moon lobe at night, since
+    // sun_color is 0 after dusk.
+    vec3 sun_l = normalize(u.sun_dir.xyz);
+    col += ggxLobe(Nw, V, sun_l, NoV, a, F0, u.sun_color.rgb) * shadow;
+    float night = 1.0 - smoothstep(-0.1, 0.2, u.sun_dir.y);
+    if (night > 0.0) col += ggxLobe(Nw, V, -sun_l, NoV, a, F0, vec3(0.85, 0.87, 1.0) * 0.15 * night);
+
     return col;
 }
 
