@@ -40,6 +40,7 @@ layout(location = 0) out vec3 v_normal;
 layout(location = 1) out vec3 v_albedo;
 layout(location = 2) out float v_ao;
 layout(location = 3) out vec2 v_motion; // screen-space motion (prev_uv - curr_uv)
+layout(location = 4) out float v_material; // 1 = water, 0 = terrain
 
 // Base colour per block id (index matches BlockId in src/block.zig).
 const vec3 block_colors[6] = vec3[](
@@ -85,4 +86,5 @@ void main() {
 
     v_normal = face_normals[face]; // axis-aligned voxel faces; no normal matrix needed
     v_albedo = block_colors[block];
+    v_material = (block == 5u) ? 1.0 : 0.0; // 5 = water (see BlockId in block.zig)
 }

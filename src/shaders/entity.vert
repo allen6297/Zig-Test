@@ -36,6 +36,7 @@ layout(location = 0) out vec3 v_normal;
 layout(location = 1) out vec3 v_albedo;
 layout(location = 2) out float v_ao;
 layout(location = 3) out vec2 v_motion;
+layout(location = 4) out float v_material; // avatars are never water
 
 // Player AABB: 0.6 wide/deep, 1.8 tall, centred on x/z, feet at pos.y.
 const vec3 player_size = vec3(0.6, 1.8, 0.6);
@@ -59,4 +60,5 @@ void main() {
     v_normal = in_normal;
     v_albedo = pc.color.rgb;
     v_ao = 1.0; // no baked AO on avatars
+    v_material = 0.0;
 }

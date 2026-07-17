@@ -104,6 +104,30 @@ float sunShadow(vec3 p, vec3 dir) {
     return 1.0;
 }
 
+// Reflective water: an animated ripple normal, a Fresnel blend between a deep
+// tint (looking straight down) and the reflected sky (grazing angles), and a
+// sharp sun glint. `shadow` dims the glint where the sun is occluded.
+vec3 waterShade(vec3 P, vec3 N, float shadow) {
+    vec3 V = normalize(u.camera_pos.xyz - P);
+    float t = u.fog.x; // elapsed seconds (wave animation)
+
+    // Small moving ripples perturbing the surface normal (x/z only, keeps it up).
+    vec3 Nw = normalize(N + vec3(
+        0.10 * sin(P.x * 0.8 + t * 1.6) + 0.06 * sin(P.z * 1.7 - t * 1.1),
+        0.0,
+        0.10 * cos(P.z * 0.9 + t * 1.4) + 0.06 * cos(P.x * 1.5 + t * 0.9)));
+
+    const vec3 deep = vec3(0.02, 0.09, 0.16);
+    float fres = pow(1.0 - max(dot(Nw, V), 0.0), 4.0);
+    vec3 refl = skyColor(normalize(reflect(-V, Nw)));
+    vec3 col = mix(deep, refl, clamp(0.05 + 0.9 * fres, 0.0, 1.0));
+
+    // Sun glint: reflect the sun over the ripple normal toward the eye.
+    float spec = pow(max(dot(reflect(-u.sun_dir.xyz, Nw), V), 0.0), 200.0);
+    col += u.sun_color.rgb * spec * shadow;
+    return col;
+}
+
 void main() {
     vec2 uv = gl_FragCoord.xy / u.params.xy;
     float depth = texture(g_depth, uv).r;
@@ -119,7 +143,9 @@ void main() {
     vec4 a = texture(g_albedo, uv);
     vec3 albedo = a.rgb;
     float ao = a.a;
-    vec3 N = normalize(texture(g_normal, uv).xyz);
+    vec4 nm = texture(g_normal, uv);
+    vec3 N = normalize(nm.xyz);
+    float is_water = nm.a; // material flag (1 = water)
     vec3 P = reconstruct(uv, depth);
 
     // Hemispherical ambient from the current sky: zenith tint above fading to a
@@ -145,7 +171,12 @@ void main() {
     float shadow = max(sunShadow(P + N * 0.05, sun_dir), atten);
     float sun = max(dot(N, sun_dir), 0.0) * shadow;
 
-    vec3 color = albedo * (ambient + point) + albedo * u.sun_color.rgb * sun;
+    vec3 color;
+    if (is_water > 0.5) {
+        color = waterShade(P, N, shadow) + point;
+    } else {
+        color = albedo * (ambient + point) + albedo * u.sun_color.rgb * sun;
+    }
 
     // Distance fog: fade toward the horizon sky colour so far terrain melts into
     // the sky (and hides the streaming edge). Exponential by view distance.

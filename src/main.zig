@@ -339,7 +339,7 @@ fn savePlayer(io: std.Io, player: *const zig_test.player.Player, cam: *const zig
 /// any chunk regenerates identically on demand): a fractal-noise heightmap for
 /// rolling hills, grass/dirt/stone layering, and 3D noise carving out caves.
 const gen_seed: u32 = 1337;
-const sea_level: i32 = 15; // water fills valleys up to this height
+const sea_level: i32 = 20; // water fills valleys up to this height
 
 fn genChunk(coord: zig_test.world.Coord, chunk: *zig_test.chunk.Chunk) void {
     const noise = zig_test.noise;
@@ -488,6 +488,7 @@ fn runLoop(
     var animate_day = true;
     var day_length: f32 = 120.0;
     var fog_density: f32 = 0.0016;
+    var elapsed: f32 = 0; // seconds since start (water wave animation)
     var fps_smooth: f32 = 60.0;
     var fps_window: f64 = 0; // time since the displayed FPS was last refreshed
 
@@ -691,6 +692,8 @@ fn runLoop(
             .fog_density = &fog_density,
         });
 
+        elapsed += @floatCast(dt);
+
         // Day/night: advance the clock and derive the sun arc + sky/fog colours.
         if (animate_day) {
             time_of_day += @as(f32, @floatCast(dt)) / @max(day_length, 1.0) * 24.0;
@@ -742,7 +745,7 @@ fn runLoop(
             .sun_color = .{ atmo.sun_color[0], atmo.sun_color[1], atmo.sun_color[2], 0 },
             .sky_zenith = .{ atmo.sky_zenith[0], atmo.sky_zenith[1], atmo.sky_zenith[2], 0 },
             .sky_horizon = .{ atmo.sky_horizon[0], atmo.sky_horizon[1], atmo.sky_horizon[2], 0 },
-            .fog = .{ 0, 0, 0, fog_density },
+            .fog = .{ elapsed, 0, 0, fog_density },
         }, planes, entity_instances[0..entity_n], ui.record);
         prev_viewproj = viewproj;
 
