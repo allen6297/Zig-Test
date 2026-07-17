@@ -77,6 +77,11 @@ void main() {
         }
     }
 
+    // History stays linear (for accumulation); the swapchain gets tonemapped +
+    // a saturation boost to counter ACES desaturating the midtones (washed look).
     out_history = vec4(result, 1.0);
-    out_swapchain = vec4(tonemap(result), 1.0);
+    vec3 tm = tonemap(result);
+    float luma = dot(tm, vec3(0.2126, 0.7152, 0.0722));
+    tm = clamp(mix(vec3(luma), tm, 1.3), 0.0, 1.0);
+    out_swapchain = vec4(tm, 1.0);
 }

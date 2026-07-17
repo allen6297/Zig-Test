@@ -223,9 +223,10 @@ fn computeAtmosphere(time_of_day: f32) Atmosphere {
 
     // Sun colour: warm/orange near the horizon, white overhead, off at night.
     const tint = lerp3(.{ 1.0, 0.45, 0.2 }, .{ 1.0, 0.95, 0.85 }, smoothstep(0.0, 0.35, height));
-    const sun_color = [3]f32{ tint[0] * day * 1.15, tint[1] * day * 1.15, tint[2] * day * 1.15 };
+    const sun_strength = day * 1.05;
+    const sun_color = [3]f32{ tint[0] * sun_strength, tint[1] * sun_strength, tint[2] * sun_strength };
 
-    const sky_zenith = lerp3(.{ 0.01, 0.02, 0.05 }, .{ 0.20, 0.42, 0.75 }, day);
+    const sky_zenith = lerp3(.{ 0.01, 0.02, 0.05 }, .{ 0.13, 0.33, 0.62 }, day);
 
     // Horizon: pale blue by day, orange at sunrise/sunset, dark at night.
     const sunset = day * (1.0 - smoothstep(0.0, 0.3, height));
@@ -477,7 +478,7 @@ fn runLoop(
     var time_of_day: f32 = 10.0;
     var animate_day = true;
     var day_length: f32 = 120.0;
-    var fog_density: f32 = 0.006;
+    var fog_density: f32 = 0.0016;
     var fps_smooth: f32 = 60.0;
     var fps_window: f64 = 0; // time since the displayed FPS was last refreshed
 

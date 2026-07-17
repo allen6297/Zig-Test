@@ -108,8 +108,8 @@ void main() {
     // darker ground bounce below, so unlit surfaces pick up the time-of-day colour
     // and go genuinely dark at night. `ao*ao` deepens creases.
     float hemi = N.y * 0.5 + 0.5; // 1 up, 0 down
-    vec3 sky_ambient = u.sky_zenith.rgb * 0.5;
-    vec3 ground_ambient = u.sky_horizon.rgb * 0.15;
+    vec3 sky_ambient = u.sky_zenith.rgb * 0.30;
+    vec3 ground_ambient = u.sky_horizon.rgb * 0.08;
     vec3 ambient = mix(ground_ambient, sky_ambient, hemi) * (ao * ao);
 
     // Dynamic point light (the player's headlamp) with inverse-square-ish falloff.
