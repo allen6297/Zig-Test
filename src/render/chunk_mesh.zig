@@ -94,12 +94,19 @@ pub fn build(allocator: std.mem.Allocator, world: *const World, cx: i32, cy: i32
 
                     const a = world.blockAt(wa[0], wa[1], wa[2]);
                     const b = world.blockAt(wb[0], wb[1], wb[2]);
-                    // A face exists only where solid meets air; it belongs to the
-                    // solid block and faces toward the air side. AO is sampled from
-                    // the occluders in that air-side layer (wb for +d, wa for −d).
+                    // A face exists where solid meets a non-solid neighbour (belongs
+                    // to the solid block, faces the non-solid side), or where water
+                    // meets air (the water surface + its edges; water↔solid is
+                    // already covered by the solid cases, water↔water is hidden). AO
+                    // is sampled from occluders on the air-side layer (wb for +d, wa
+                    // for −d).
                     mask[i + j * size] = if (a.isSolid() and !b.isSolid())
                         .{ .present = true, .face = pos_faces[d], .block = @intFromEnum(a), .ao = cornerAO(world, wb, u, v) }
                     else if (b.isSolid() and !a.isSolid())
+                        .{ .present = true, .face = neg_faces[d], .block = @intFromEnum(b), .ao = cornerAO(world, wa, u, v) }
+                    else if (a == .water and b == .air)
+                        .{ .present = true, .face = pos_faces[d], .block = @intFromEnum(a), .ao = cornerAO(world, wb, u, v) }
+                    else if (b == .water and a == .air)
                         .{ .present = true, .face = neg_faces[d], .block = @intFromEnum(b), .ao = cornerAO(world, wa, u, v) }
                     else
                         .{};

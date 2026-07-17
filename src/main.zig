@@ -339,6 +339,7 @@ fn savePlayer(io: std.Io, player: *const zig_test.player.Player, cam: *const zig
 /// any chunk regenerates identically on demand): a fractal-noise heightmap for
 /// rolling hills, grass/dirt/stone layering, and 3D noise carving out caves.
 const gen_seed: u32 = 1337;
+const sea_level: i32 = 15; // water fills valleys up to this height
 
 fn genChunk(coord: zig_test.world.Coord, chunk: *zig_test.chunk.Chunk) void {
     const noise = zig_test.noise;
@@ -359,7 +360,12 @@ fn genChunk(coord: zig_test.world.Coord, chunk: *zig_test.chunk.Chunk) void {
             var ly: usize = 0;
             while (ly < size) : (ly += 1) {
                 const wy: i32 = coord.y * size + @as(i32, @intCast(ly));
-                if (wy >= height) continue;
+                if (wy >= height) {
+                    // Above the terrain: fill up to sea level with water (lakes in
+                    // the low valleys), everything higher is air.
+                    if (wy < sea_level) chunk.set(lx, ly, lz, .water);
+                    continue;
+                }
 
                 // Caves: 3D noise carves hollows. The carve threshold is
                 // depth-graduated — roomy caves deep down (fBm > 0.60 ≈ 20% of
@@ -371,8 +377,11 @@ fn genChunk(coord: zig_test.world.Coord, chunk: *zig_test.chunk.Chunk) void {
                 const cave = noise.fbm3(wx * 0.045, @as(f32, @floatFromInt(wy)) * 0.045, wz * 0.045, gen_seed +% 99, 3);
                 if (cave > threshold) continue; // hollow
 
-                const block: zig_test.block.BlockId =
-                    if (wy + 1 == height) .grass else if (wy + 3 >= height) .dirt else .stone;
+                // Surface layer: sand at the shoreline (near/below sea level), grass
+                // above; dirt just under; stone deep.
+                const block: zig_test.block.BlockId = if (wy + 1 == height)
+                    (if (height <= sea_level + 1) .sand else .grass)
+                else if (wy + 3 >= height) .dirt else .stone;
                 chunk.set(lx, ly, lz, block);
             }
         }
